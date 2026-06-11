@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Markdown Viewer
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
-// @description  Automatically formats and displays .md files with a pleasant, readable theme and font settings. Turn your browser into the only Markdown viewer you need by giving your Tampermonkey access to local files.
-// @description:en Automatically formats and displays .md files with a pleasant, readable theme and font settings. Turn your browser into the only Markdown viewer you need by giving your Tampermonkey access to local files.
-// @description:de Automatisch .md-Dateien formatieren und anzeigen mit einem angenehmen, lesbaren Thema und Schriftarten. Machen Sie Ihren Browser zum einzigen Markdown-Viewer, den Sie benötigen, indem Sie Tampermonkey Zugriff auf lokale Dateien gewähren.
+// @version      2.4.0
+// @description  Automatically formats and displays .md files with a pleasant, readable theme, font settings, and an optional slide deck view.
+// @description:en Automatically formats and displays .md files with a pleasant, readable theme, font settings, and an optional slide deck view.
+// @description:de Automatisch .md-Dateien formatieren und anzeigen mit einem angenehmen, lesbaren Thema, Schriftarten und optionaler Folienansicht.
 // @author       anga83 (original), artsy-compute
 // @license      MIT
 // @homepageURL  https://greasyfork.org/zh-TW/scripts/538817-markdown-viewer
@@ -28,12 +28,17 @@
     // --- SETTINGS IDENTIFIERS ---
     const FONT_STYLE_KEY = 'markdownViewer_fontStyle';
     const THEME_KEY = 'markdownViewer_theme';
+    const VIEW_MODE_KEY = 'markdownViewer_viewMode';
     const STYLE_ELEMENT_ID_FONT = 'userscript-markdown-font-style';
     const STYLE_ELEMENT_ID_THEME = 'userscript-markdown-theme-style';
     const STYLE_ELEMENT_ID_BASE = 'userscript-markdown-base-style';
     const SAFE_HREF_PROTOCOLS = new Set(['http:', 'https:', 'file:', 'mailto:']);
     const SAFE_SRC_PROTOCOLS = new Set(['http:', 'https:', 'file:']);
     const ALLOWED_URI_REGEXP = /^(?:(?:https?|file|mailto):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i;
+    const VIEW_MODES = new Set(['markdown', 'slides']);
+    const viewerState = {
+        setViewMode: null
+    };
 
     // --- FONT SETTINGS ---
     const FONT_SETTINGS = {
@@ -78,6 +83,20 @@
         if (useDarkTheme) {
             // Dark Theme
             themeCss += `
+                :root {
+                    --markdown-control-bg: #202326;
+                    --markdown-control-bg-hover: #2b3036;
+                    --markdown-control-bg-active: #34506f;
+                    --markdown-control-border: #3f464f;
+                    --markdown-control-border-active: #6aa5dc;
+                    --markdown-control-text: #e1e4e8;
+                    --markdown-control-muted: #aeb6c1;
+                    --markdown-slide-page-bg: #101214;
+                    --markdown-slide-surface: #17191c;
+                    --markdown-slide-surface-2: #20242a;
+                    --markdown-slide-border: #343a42;
+                    --markdown-slide-shadow: rgba(0, 0, 0, 0.34);
+                }
                 body {
                     background-color: rgb(27, 28, 29) !important;
                     color: rgb(220, 220, 220) !important;
@@ -144,6 +163,20 @@
             `;
         } else { // Light Theme
             themeCss += `
+                :root {
+                    --markdown-control-bg: #f6f8fa;
+                    --markdown-control-bg-hover: #eaeef2;
+                    --markdown-control-bg-active: #dbeafe;
+                    --markdown-control-border: #d0d7de;
+                    --markdown-control-border-active: #0969da;
+                    --markdown-control-text: #24292e;
+                    --markdown-control-muted: #57606a;
+                    --markdown-slide-page-bg: #f3f4f6;
+                    --markdown-slide-surface: #ffffff;
+                    --markdown-slide-surface-2: #f8fafc;
+                    --markdown-slide-border: #d8dee4;
+                    --markdown-slide-shadow: rgba(31, 35, 40, 0.14);
+                }
                 body {
                     background-color: #ffffff !important;
                     color: #24292e !important;
@@ -238,11 +271,86 @@
         applyThemeStyle();
     });
 
+    GM_registerMenuCommand('View: Markdown', () => {
+        if (typeof viewerState.setViewMode === 'function') {
+            viewerState.setViewMode('markdown');
+        } else {
+            GM_setValue(VIEW_MODE_KEY, 'markdown');
+        }
+    });
+
+    GM_registerMenuCommand('View: Slides', () => {
+        if (typeof viewerState.setViewMode === 'function') {
+            viewerState.setViewMode('slides');
+        } else {
+            GM_setValue(VIEW_MODE_KEY, 'slides');
+        }
+    });
+
     // --- BASE STYLES ---
     function applyBaseStyles() {
         addStyleElement(STYLE_ELEMENT_ID_BASE, `
             body {
                 margin: 0;
+            }
+            .markdown-viewer-shell {
+                box-sizing: border-box;
+                min-width: 200px;
+                width: 100%;
+            }
+            .markdown-viewer-toolbar {
+                box-sizing: border-box;
+                max-width: 980px;
+                margin: 0 auto;
+                padding: 14px 30px 0;
+                display: flex;
+                justify-content: flex-end;
+                gap: 8px;
+                font-family: "Segoe UI", "SF Pro Text", "Helvetica Neue", "Ubuntu", "Arial", sans-serif;
+            }
+            .markdown-viewer-toggle {
+                display: inline-flex;
+                gap: 3px;
+                padding: 3px;
+                border: 1px solid var(--markdown-control-border);
+                border-radius: 8px;
+                background: var(--markdown-control-bg);
+            }
+            .markdown-viewer-toggle-button,
+            .markdown-slide-button {
+                appearance: none;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                background: transparent;
+                color: var(--markdown-control-muted);
+                cursor: pointer;
+                font: inherit;
+                font-size: 0.86rem;
+                line-height: 1.2;
+                min-width: 86px;
+                padding: 7px 11px;
+                text-align: center;
+                transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+            }
+            .markdown-viewer-toggle-button:hover,
+            .markdown-viewer-toggle-button:focus-visible,
+            .markdown-slide-button:hover,
+            .markdown-slide-button:focus-visible {
+                background: var(--markdown-control-bg-hover);
+                color: var(--markdown-control-text);
+                outline: none;
+            }
+            .markdown-viewer-toggle-button.is-active {
+                background: var(--markdown-control-bg-active);
+                border-color: var(--markdown-control-border-active);
+                color: var(--markdown-control-text);
+            }
+            .markdown-slide-button:disabled {
+                cursor: default;
+                opacity: 0.45;
+            }
+            .markdown-viewer-panel[hidden] {
+                display: none !important;
             }
             .markdown-body {
                 box-sizing: border-box;
@@ -250,6 +358,112 @@
                 max-width: 980px;
                 margin: 0 auto;
                 padding: 15px 30px 30px;
+            }
+            .markdown-slides-panel {
+                box-sizing: border-box;
+                min-height: calc(100vh - 54px);
+                padding: 18px 16px 30px;
+                background: var(--markdown-slide-page-bg);
+            }
+            .markdown-slide-deck {
+                max-width: 1180px;
+                margin: 0 auto;
+            }
+            .markdown-slide-stage {
+                box-sizing: border-box;
+                aspect-ratio: 16 / 9;
+                width: 100%;
+                max-height: calc(100vh - 150px);
+                min-height: 360px;
+                position: relative;
+                overflow: hidden;
+                border: 1px solid var(--markdown-slide-border);
+                border-radius: 8px;
+                background: var(--markdown-slide-surface);
+                box-shadow: 0 22px 60px var(--markdown-slide-shadow);
+            }
+            .markdown-slide {
+                box-sizing: border-box;
+                display: none;
+                width: 100%;
+                height: 100%;
+                overflow: auto;
+                padding: 54px 64px;
+            }
+            .markdown-slide.is-active {
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+            }
+            .markdown-slide-content.markdown-body {
+                width: 100%;
+                min-width: 0;
+                max-width: none;
+                margin: 0;
+                padding: 0;
+                font-size: 1.24rem;
+                line-height: 1.5;
+            }
+            .markdown-slide-content h1,
+            .markdown-slide-content h2 {
+                margin-top: 0;
+                line-height: 1.08;
+            }
+            .markdown-slide-content h1 {
+                font-size: 2.8rem;
+            }
+            .markdown-slide-content h2 {
+                font-size: 2.25rem;
+            }
+            .markdown-slide-content h3 {
+                font-size: 1.65rem;
+            }
+            .markdown-slide-content p,
+            .markdown-slide-content li {
+                font-size: 1.24rem;
+            }
+            .markdown-slide-content pre {
+                max-height: 36vh;
+            }
+            .markdown-slide-content img {
+                max-height: 48vh;
+                object-fit: contain;
+            }
+            .markdown-slide-controls {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                margin-top: 14px;
+                font-family: "Segoe UI", "SF Pro Text", "Helvetica Neue", "Ubuntu", "Arial", sans-serif;
+            }
+            .markdown-slide-button-group {
+                display: inline-flex;
+                gap: 3px;
+                padding: 3px;
+                border: 1px solid var(--markdown-control-border);
+                border-radius: 8px;
+                background: var(--markdown-control-bg);
+            }
+            .markdown-slide-status {
+                min-width: 72px;
+                color: var(--markdown-control-muted);
+                font-size: 0.9rem;
+                text-align: center;
+            }
+            .markdown-slide-progress {
+                height: 4px;
+                flex: 1 1 auto;
+                overflow: hidden;
+                border-radius: 999px;
+                background: var(--markdown-slide-surface-2);
+                border: 1px solid var(--markdown-slide-border);
+            }
+            .markdown-slide-progress-bar {
+                height: 100%;
+                width: 0;
+                background: var(--markdown-control-border-active);
+                transition: width 0.18s ease;
             }
             .markdown-body img {
                 max-width: 100%; /* Korrigiert von 150% auf 100% */
@@ -319,8 +533,53 @@
                 padding: 0 1em; /* Innenabstand */
             }
             @media (max-width: 767px) {
+                .markdown-viewer-toolbar {
+                    padding: 12px 15px 0;
+                    justify-content: stretch;
+                }
+                .markdown-viewer-toggle {
+                    width: 100%;
+                }
+                .markdown-viewer-toggle-button {
+                    flex: 1 1 0;
+                    min-width: 0;
+                }
                 .markdown-body {
                     padding: 20px 15px 15px;
+                }
+                .markdown-slides-panel {
+                    min-height: calc(100vh - 50px);
+                    padding: 12px 10px 20px;
+                }
+                .markdown-slide-stage {
+                    min-height: 420px;
+                    max-height: none;
+                    aspect-ratio: auto;
+                }
+                .markdown-slide {
+                    padding: 30px 24px;
+                }
+                .markdown-slide-content.markdown-body {
+                    font-size: 1rem;
+                }
+                .markdown-slide-content h1 { font-size: 2rem; }
+                .markdown-slide-content h2 { font-size: 1.65rem; }
+                .markdown-slide-content h3 { font-size: 1.35rem; }
+                .markdown-slide-content p,
+                .markdown-slide-content li { font-size: 1rem; }
+                .markdown-slide-controls {
+                    align-items: stretch;
+                    flex-wrap: wrap;
+                }
+                .markdown-slide-button-group {
+                    flex: 1 1 auto;
+                }
+                .markdown-slide-button {
+                    flex: 1 1 0;
+                    min-width: 0;
+                }
+                .markdown-slide-progress {
+                    flex-basis: 100%;
                 }
                 .markdown-body h1 { font-size: 1.8em; }
                 .markdown-body h2 { font-size: 1.5em; }
@@ -473,6 +732,238 @@
         return cleanFragment;
     }
 
+
+    function splitMarkdownIntoSlides(markdownText) {
+        let lines = String(markdownText || '').replace(/\r\n?/g, '\n').split('\n');
+        if (/^\s*---\s*$/.test(lines[0] || '')) {
+            const closingIndex = lines.slice(1).findIndex((line) => /^\s*---\s*$/.test(line));
+            const frontMatterLines = closingIndex >= 0 ? lines.slice(1, closingIndex + 1) : [];
+            const looksLikeFrontMatter = frontMatterLines.some((line) => /^\s*[A-Za-z0-9_-]+:\s*/.test(line));
+            if (looksLikeFrontMatter) {
+                lines = lines.slice(closingIndex + 2);
+            }
+        }
+
+        const explicitSlides = [];
+        let currentSlideLines = [];
+        let foundExplicitSeparator = false;
+        let insideFence = false;
+
+        lines.forEach((line) => {
+            if (/^\s*(```|~~~)/.test(line)) {
+                insideFence = !insideFence;
+            }
+
+            if (!insideFence && /^\s*---+\s*$/.test(line)) {
+                foundExplicitSeparator = true;
+                explicitSlides.push(currentSlideLines.join('\n').trim());
+                currentSlideLines = [];
+                return;
+            }
+
+            currentSlideLines.push(line);
+        });
+
+        if (foundExplicitSeparator) {
+            explicitSlides.push(currentSlideLines.join('\n').trim());
+            const nonEmptySlides = explicitSlides.filter(Boolean);
+            return nonEmptySlides.length ? nonEmptySlides : ['# Slide'];
+        }
+
+        const headingSlides = [];
+        currentSlideLines = [];
+        insideFence = false;
+
+        lines.forEach((line) => {
+            if (/^\s*(```|~~~)/.test(line)) {
+                insideFence = !insideFence;
+            }
+
+            if (!insideFence && /^\s*#{1,2}\s+/.test(line) && currentSlideLines.join('\n').trim()) {
+                headingSlides.push(currentSlideLines.join('\n').trim());
+                currentSlideLines = [];
+            }
+
+            currentSlideLines.push(line);
+        });
+
+        headingSlides.push(currentSlideLines.join('\n').trim());
+        const nonEmptySlides = headingSlides.filter(Boolean);
+        return nonEmptySlides.length ? nonEmptySlides : ['# Slide'];
+    }
+
+    function getInitialViewMode() {
+        const storedMode = GM_getValue(VIEW_MODE_KEY, 'markdown');
+        return VIEW_MODES.has(storedMode) ? storedMode : 'markdown';
+    }
+
+    function isEditableElement(element) {
+        if (!element) {
+            return false;
+        }
+
+        const tagName = String(element.tagName || '').toLowerCase();
+        return element.isContentEditable || ['input', 'textarea', 'select', 'button'].includes(tagName);
+    }
+
+    function createSlidesPanel(markdownText) {
+        const panel = document.createElement('section');
+        panel.className = 'markdown-slides-panel markdown-viewer-panel';
+        panel.setAttribute('aria-label', 'Slide deck view');
+
+        const deck = document.createElement('div');
+        deck.className = 'markdown-slide-deck';
+
+        const stage = document.createElement('div');
+        stage.className = 'markdown-slide-stage';
+
+        const slideSources = splitMarkdownIntoSlides(markdownText);
+        const slides = slideSources.map((slideMarkdown, index) => {
+            const slide = document.createElement('section');
+            slide.className = 'markdown-slide';
+            slide.setAttribute('aria-label', `Slide ${index + 1}`);
+
+            const slideContent = document.createElement('div');
+            slideContent.className = 'markdown-body markdown-slide-content';
+            slideContent.replaceChildren(sanitizeMarkdownHtml(marked.parse(slideMarkdown)));
+            slide.appendChild(slideContent);
+            stage.appendChild(slide);
+            return slide;
+        });
+
+        const controls = document.createElement('div');
+        controls.className = 'markdown-slide-controls';
+
+        const navGroup = document.createElement('div');
+        navGroup.className = 'markdown-slide-button-group';
+
+        const previousButton = document.createElement('button');
+        previousButton.type = 'button';
+        previousButton.className = 'markdown-slide-button';
+        previousButton.textContent = 'Prev';
+
+        const nextButton = document.createElement('button');
+        nextButton.type = 'button';
+        nextButton.className = 'markdown-slide-button';
+        nextButton.textContent = 'Next';
+
+        navGroup.append(previousButton, nextButton);
+
+        const slideStatus = document.createElement('div');
+        slideStatus.className = 'markdown-slide-status';
+
+        const progress = document.createElement('div');
+        progress.className = 'markdown-slide-progress';
+        const progressBar = document.createElement('div');
+        progressBar.className = 'markdown-slide-progress-bar';
+        progress.appendChild(progressBar);
+
+        const presentGroup = document.createElement('div');
+        presentGroup.className = 'markdown-slide-button-group';
+
+        const presentButton = document.createElement('button');
+        presentButton.type = 'button';
+        presentButton.className = 'markdown-slide-button';
+        presentButton.textContent = 'Present';
+        presentGroup.appendChild(presentButton);
+
+        controls.append(navGroup, slideStatus, progress, presentGroup);
+        deck.append(stage, controls);
+        panel.appendChild(deck);
+
+        let currentSlideIndex = 0;
+
+        function setSlide(nextIndex) {
+            currentSlideIndex = Math.max(0, Math.min(slides.length - 1, nextIndex));
+            slides.forEach((slide, index) => {
+                const isActive = index === currentSlideIndex;
+                slide.classList.toggle('is-active', isActive);
+                slide.hidden = !isActive;
+            });
+
+            previousButton.disabled = currentSlideIndex === 0;
+            nextButton.disabled = currentSlideIndex === slides.length - 1;
+            slideStatus.textContent = `${currentSlideIndex + 1} / ${slides.length}`;
+            progressBar.style.width = `${((currentSlideIndex + 1) / slides.length) * 100}%`;
+        }
+
+        previousButton.addEventListener('click', () => setSlide(currentSlideIndex - 1));
+        nextButton.addEventListener('click', () => setSlide(currentSlideIndex + 1));
+        presentButton.addEventListener('click', () => {
+            if (stage.requestFullscreen) {
+                stage.requestFullscreen();
+            }
+        });
+
+        document.addEventListener('keydown', (event) => {
+            if (panel.hidden || isEditableElement(event.target)) {
+                return;
+            }
+
+            if (['ArrowRight', 'PageDown', ' '].includes(event.key)) {
+                event.preventDefault();
+                setSlide(currentSlideIndex + 1);
+            } else if (['ArrowLeft', 'PageUp'].includes(event.key)) {
+                event.preventDefault();
+                setSlide(currentSlideIndex - 1);
+            } else if (event.key === 'Home') {
+                event.preventDefault();
+                setSlide(0);
+            } else if (event.key === 'End') {
+                event.preventDefault();
+                setSlide(slides.length - 1);
+            }
+        });
+
+        setSlide(0);
+
+        return {
+            panel,
+            setSlide
+        };
+    }
+
+    function createViewerShell(markdownPanel, slidesPanel, onModeChange) {
+        const shell = document.createElement('main');
+        shell.className = 'markdown-viewer-shell';
+
+        const toolbar = document.createElement('div');
+        toolbar.className = 'markdown-viewer-toolbar';
+
+        const toggle = document.createElement('div');
+        toggle.className = 'markdown-viewer-toggle';
+        toggle.setAttribute('role', 'group');
+        toggle.setAttribute('aria-label', 'View mode');
+
+        const markdownButton = document.createElement('button');
+        markdownButton.type = 'button';
+        markdownButton.className = 'markdown-viewer-toggle-button';
+        markdownButton.textContent = 'Markdown';
+        markdownButton.dataset.viewMode = 'markdown';
+
+        const slidesButton = document.createElement('button');
+        slidesButton.type = 'button';
+        slidesButton.className = 'markdown-viewer-toggle-button';
+        slidesButton.textContent = 'Slides';
+        slidesButton.dataset.viewMode = 'slides';
+
+        [markdownButton, slidesButton].forEach((button) => {
+            button.addEventListener('click', () => onModeChange(button.dataset.viewMode));
+            toggle.appendChild(button);
+        });
+
+        toolbar.appendChild(toggle);
+        shell.append(toolbar, markdownPanel, slidesPanel);
+
+        return {
+            shell,
+            buttons: {
+                markdown: markdownButton,
+                slides: slidesButton
+            }
+        };
+    }
+
     function showError(markdownBodyDiv, message) {
         const errorParagraph = document.createElement('p');
         errorParagraph.style.color = 'red';
@@ -497,7 +988,7 @@
         }
 
         const markdownBodyDiv = document.createElement('div');
-        markdownBodyDiv.className = 'markdown-body';
+        markdownBodyDiv.className = 'markdown-body markdown-viewer-panel';
 
         // Überprüfen, ob marked durch @require geladen wurde
         if (typeof marked === 'undefined' || typeof marked.parse !== 'function') {
@@ -556,9 +1047,28 @@
 
             const dirtyHtmlContent = marked.parse(markdownContentToParse);
             const sanitizedFragment = sanitizeMarkdownHtml(dirtyHtmlContent);
-
-            document.body.replaceChildren(markdownBodyDiv);
             markdownBodyDiv.replaceChildren(sanitizedFragment);
+
+            const slidesView = createSlidesPanel(markdownContentToParse);
+            let currentViewMode = getInitialViewMode();
+
+            const setViewMode = (requestedMode) => {
+                currentViewMode = VIEW_MODES.has(requestedMode) ? requestedMode : 'markdown';
+                GM_setValue(VIEW_MODE_KEY, currentViewMode);
+
+                markdownBodyDiv.hidden = currentViewMode !== 'markdown';
+                slidesView.panel.hidden = currentViewMode !== 'slides';
+                viewerControls.buttons.markdown.classList.toggle('is-active', currentViewMode === 'markdown');
+                viewerControls.buttons.markdown.setAttribute('aria-pressed', String(currentViewMode === 'markdown'));
+                viewerControls.buttons.slides.classList.toggle('is-active', currentViewMode === 'slides');
+                viewerControls.buttons.slides.setAttribute('aria-pressed', String(currentViewMode === 'slides'));
+            };
+
+            const viewerControls = createViewerShell(markdownBodyDiv, slidesView.panel, setViewMode);
+            viewerState.setViewMode = setViewMode;
+
+            document.body.replaceChildren(viewerControls.shell);
+            setViewMode(currentViewMode);
 
         } catch (e) {
             console.error("Markdown Viewer: Error during Markdown parsing:", e);
