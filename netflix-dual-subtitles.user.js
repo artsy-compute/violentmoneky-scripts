@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.7.7
-// @description  Manually select Traditional Chinese and Japanese Netflix subtitles once; cache intercepted subtitle XML and display both together.
-// @description:en Manually select Traditional Chinese and Japanese Netflix subtitles once; cache intercepted subtitle XML and display both together.
+// @version      0.8.5
+// @description  Manually select Netflix subtitle languages; cache intercepted subtitle XML and display the latest two together.
+// @description:en Manually select Netflix subtitle languages; cache intercepted subtitle XML and display the latest two together.
 // @author       artsy-compute
 // @license      MIT
 // @match        https://www.netflix.com/watch/*
@@ -22,16 +22,33 @@
     const ROOT_ID = 'netflix-dual-subtitles-root';
     const STYLE_ID = 'netflix-dual-subtitles-style';
     const BRIDGE_EVENT = 'netflix-dual-subtitles:response';
-    const LANGS = ['zh-TW', 'ja'];
     const RENDER_INTERVAL_MS = 100;
     const MAX_RESPONSE_CHARS = 4_000_000;
     const CACHE_VERSION = 3;
+    const MAX_DISPLAY_LANGS = 2;
+    const HIDE_NATIVE_PREF_KEY = 'netflix-dual-subtitles:hide-native';
+
+    function loadHideNativePreference() {
+        try {
+            return localStorage.getItem(HIDE_NATIVE_PREF_KEY) !== '0';
+        } catch (_) {
+            return true;
+        }
+    }
+
+    function saveHideNativePreference(value) {
+        try {
+            localStorage.setItem(HIDE_NATIVE_PREF_KEY, value ? '1' : '0');
+        } catch (_) {}
+    }
 
     const state = {
         enabled: true,
         showStatus: false,
+        hideNative: loadHideNativePreference(),
         requestedUrls: new Set(),
-        displayLangs: [...LANGS],
+        videoId: '',
+        displayLangs: [],
         tracks: new Map(),
         root: null,
         textNode: null,
@@ -39,7 +56,7 @@
         toastNode: null,
         toastTimer: null,
         lastText: '',
-        status: 'manual mode: select zh-TW subtitle, then Japanese',
+        status: 'manual mode: select subtitle languages; latest two are shown',
         ignoredPayloads: 0
     };
 
@@ -48,8 +65,73 @@
         return match ? match[1] : 'unknown';
     }
 
+    function cachePrefix() {
+        return 'netflix-dual-subtitles:v' + CACHE_VERSION + ':' + (state.videoId || videoId()) + ':';
+    }
+
     function cacheKey(lang) {
-        return 'netflix-dual-subtitles:v' + CACHE_VERSION + ':' + videoId() + ':' + lang;
+        return cachePrefix() + lang;
+    }
+
+    function langIndexKey() {
+        return cachePrefix() + '__langs';
+    }
+
+    function normalizeLang(raw) {
+        const lang = String(raw || '').trim().toLowerCase().replace(/_/g, '-');
+        if (!lang) {
+            return '';
+        }
+
+        if (/^(ja|jpn)(-|$)/.test(lang)) {
+            return 'ja';
+        }
+        if (/^(zh-(tw|hant|hk|mo)|cmn-hant)(-|$)/.test(lang) || /hant|traditional/.test(lang)) {
+            return 'zh-TW';
+        }
+        if (/^(zh-(cn|hans|sg)|cmn-hans)(-|$)/.test(lang) || /hans|simplified/.test(lang)) {
+            return 'zh-CN';
+        }
+
+        const parts = lang.split('-').filter(Boolean);
+        if (!parts.length) {
+            return '';
+        }
+        if (parts.length === 1) {
+            return parts[0];
+        }
+        return parts[0] + '-' + parts.slice(1).map(part => part.length === 2 ? part.toUpperCase() : part).join('-');
+    }
+
+    function knownLangs() {
+        const langs = new Set(state.tracks.keys());
+        try {
+            const indexed = JSON.parse(localStorage.getItem(langIndexKey()) || '[]');
+            if (Array.isArray(indexed)) {
+                indexed.map(normalizeLang).filter(Boolean).forEach(lang => langs.add(lang));
+            }
+        } catch (_) {}
+        return Array.from(langs);
+    }
+
+    function saveLangIndex() {
+        try {
+            localStorage.setItem(langIndexKey(), JSON.stringify(knownLangs().sort()));
+        } catch (_) {}
+    }
+
+    function promoteDisplayLang(lang) {
+        const normalized = normalizeLang(lang);
+        if (!normalized) {
+            return false;
+        }
+
+        const before = state.displayLangs.join('\n');
+        state.displayLangs = [normalized, ...state.displayLangs.filter(item => item !== normalized)]
+            .filter(item => state.tracks.has(item))
+            .slice(0, MAX_DISPLAY_LANGS);
+        state.lastText = '';
+        return before !== state.displayLangs.join('\n');
     }
 
     function notify(message) {
@@ -73,28 +155,42 @@
     }
 
     function saveTrack(lang, cues, sourceUrl) {
-        if (!cues.length) {
+        const normalized = normalizeLang(lang);
+        if (!normalized || !cues.length) {
             return false;
         }
 
         const track = {
-            lang,
+            lang: normalized,
             cues: cues.slice().sort((a, b) => a.start - b.start),
             sourceUrl: sourceUrl || '',
             savedAt: Date.now()
         };
-        state.tracks.set(lang, track);
+        state.tracks.set(normalized, track);
 
         try {
-            localStorage.setItem(cacheKey(lang), JSON.stringify(track));
+            localStorage.setItem(cacheKey(normalized), JSON.stringify(track));
         } catch (_) {}
+        saveLangIndex();
+        promoteDisplayLang(normalized);
 
-        notify('Captured ' + lang + ' subtitles (' + track.cues.length + ' cues)');
+        notify('Captured ' + normalized + ' subtitles (' + track.cues.length + ' cues)');
         return true;
     }
 
     function loadCachedTracks() {
-        for (const lang of LANGS) {
+        const candidates = new Set(knownLangs());
+        try {
+            const prefix = cachePrefix();
+            for (let index = 0; index < localStorage.length; index += 1) {
+                const key = localStorage.key(index);
+                if (key && key.startsWith(prefix) && key !== langIndexKey()) {
+                    candidates.add(normalizeLang(key.slice(prefix.length)));
+                }
+            }
+        } catch (_) {}
+
+        for (const lang of Array.from(candidates).filter(Boolean)) {
             try {
                 const raw = localStorage.getItem(cacheKey(lang));
                 if (!raw) {
@@ -102,11 +198,19 @@
                 }
 
                 const track = JSON.parse(raw);
-                if (track && track.lang === lang && Array.isArray(track.cues) && track.cues.length) {
-                    state.tracks.set(lang, track);
+                const trackLang = normalizeLang(track && track.lang || lang);
+                if (trackLang && Array.isArray(track.cues) && track.cues.length) {
+                    track.lang = trackLang;
+                    state.tracks.set(trackLang, track);
                 }
             } catch (_) {}
         }
+
+        state.displayLangs = Array.from(state.tracks.values())
+            .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0))
+            .map(track => track.lang)
+            .slice(0, MAX_DISPLAY_LANGS);
+        saveLangIndex();
     }
 
 
@@ -117,12 +221,19 @@
     }
 
     function clearCachedTracks() {
-        for (const lang of LANGS) {
-            state.tracks.delete(lang);
-            try {
-                localStorage.removeItem(cacheKey(lang));
-            } catch (_) {}
-        }
+        const prefix = cachePrefix();
+        state.tracks.clear();
+        state.displayLangs = [];
+        try {
+            const keys = [];
+            for (let index = 0; index < localStorage.length; index += 1) {
+                const key = localStorage.key(index);
+                if (key && key.startsWith(prefix)) {
+                    keys.push(key);
+                }
+            }
+            keys.forEach(key => localStorage.removeItem(key));
+        } catch (_) {}
         state.lastText = '';
         state.status = 'cache cleared';
         render();
@@ -149,6 +260,9 @@
                 font-family: "Noto Sans CJK TC", "Noto Sans CJK JP", "Hiragino Sans", "Microsoft JhengHei", "Yu Gothic", Arial, sans-serif;
             }
             #${ROOT_ID}.is-hidden { display: none; }
+            html.nds-hide-native-subtitles .player-timedtext-text-container {
+                display: none !important;
+            }
             .nds-lines {
                 max-width: min(96vw, 1680px);
                 display: grid;
@@ -249,8 +363,13 @@
         return track.cues.find(cue => timeMs >= cue.start - 80 && timeMs <= cue.end + 500) || null;
     }
 
+    function applyNativeSubtitleVisibility() {
+        document.documentElement.classList.toggle('nds-hide-native-subtitles', state.hideNative);
+    }
+
     function render() {
         createOverlay();
+        applyNativeSubtitleVisibility();
         if (!state.root || !state.textNode || !state.statusNode) {
             return;
         }
@@ -361,23 +480,6 @@
         return match ? match[1] : '';
     }
 
-    function languageMatchesPayload(targetLang, payload) {
-        const lang = payloadLang(payload).toLowerCase();
-        if (!lang) {
-            return true;
-        }
-
-        if (targetLang === 'zh-TW') {
-            return /^(zh-(tw|hant|hk|mo)|zh_hant|zh-tw|cmn-hant)/i.test(lang) || /hant|traditional|tw/i.test(lang);
-        }
-
-        if (targetLang === 'ja') {
-            return /^(ja|jpn)(-|_|$)/i.test(lang) || lang === 'ja';
-        }
-
-        return true;
-    }
-
     function parseTtml(text) {
         const doc = new DOMParser().parseFromString(String(text || ''), 'application/xml');
         if (doc.querySelector('parsererror')) {
@@ -458,14 +560,7 @@
     }
 
     function inferPayloadLang(payload) {
-        const lang = payloadLang(payload).toLowerCase();
-        if (/^(zh-(tw|hant|hk|mo)|zh_hant|cmn-hant)/i.test(lang) || /hant|traditional|tw/i.test(lang)) {
-            return 'zh-TW';
-        }
-        if (/^(ja|jpn)(-|_|$)/i.test(lang) || lang === 'ja') {
-            return 'ja';
-        }
-        return '';
+        return normalizeLang(payloadLang(payload));
     }
 
     function subtitleUrlCandidate(url, entry) {
@@ -516,11 +611,15 @@
         }
 
         state.requestedUrls.add(url);
+        const requestVideoId = state.videoId || videoId();
         state.status = 'intercepted ?o=1 request #' + state.requestedUrls.size;
         render();
 
         try {
             const response = await gmGet(url);
+            if (requestVideoId !== (state.videoId || videoId())) {
+                return;
+            }
             const body = String(response.responseText || '');
             if (response.status >= 400 || body.length > MAX_RESPONSE_CHARS) {
                 state.status = 'fetch skipped: HTTP ' + response.status;
@@ -545,11 +644,6 @@
         if (!lang) {
             state.ignoredPayloads += 1;
             state.status = 'ignored subtitle payload lang=' + rawLang + ' ignored=' + state.ignoredPayloads;
-            render();
-            return;
-        }
-        if (state.tracks.has(lang)) {
-            state.status = 'already captured ' + lang + '; ignored duplicate lang=' + rawLang;
             render();
             return;
         }
@@ -639,6 +733,36 @@
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    function switchVideoContext(nextVideoId, initial = false) {
+        const normalizedVideoId = nextVideoId || 'unknown';
+        if (!initial && normalizedVideoId === state.videoId) {
+            return;
+        }
+
+        state.videoId = normalizedVideoId;
+        state.requestedUrls.clear();
+        state.tracks.clear();
+        state.displayLangs = [];
+        state.lastText = '';
+        state.ignoredPayloads = 0;
+        removeLegacyGenericChineseCache();
+        loadCachedTracks();
+        if (!initial) {
+            state.status = 'new video detected; select subtitles to cache latest two';
+            notify(state.status);
+        }
+        render();
+    }
+
+    function watchVideoChanges() {
+        setInterval(() => {
+            const currentVideoId = videoId();
+            if (currentVideoId !== state.videoId) {
+                switchVideoContext(currentVideoId);
+            }
+        }, 500);
+    }
+
     function registerMenu() {
         if (typeof GM_registerMenuCommand !== 'function') {
             return;
@@ -648,6 +772,11 @@
             state.displayLangs.reverse();
             state.lastText = '';
             render();
+        });
+        GM_registerMenuCommand('Netflix Dual Subtitles: Toggle native Netflix subtitles', () => {
+            state.hideNative = !state.hideNative;
+            saveHideNativePreference(state.hideNative);
+            notify(state.hideNative ? 'Native Netflix subtitles hidden' : 'Native Netflix subtitles visible');
         });
         GM_registerMenuCommand('Netflix Dual Subtitles: Toggle status', () => {
             state.showStatus = !state.showStatus;
@@ -659,10 +788,10 @@
     function init() {
         injectNetworkBridge();
         window.addEventListener(BRIDGE_EVENT, event => rememberPayload(event.detail.url, event.detail.payload));
-        observeSubtitleRequests();
         registerMenu();
-        removeLegacyGenericChineseCache();
-        loadCachedTracks();
+        switchVideoContext(videoId(), true);
+        observeSubtitleRequests();
+        watchVideoChanges();
 
         const startup = setInterval(() => {
             if (document.body) {
