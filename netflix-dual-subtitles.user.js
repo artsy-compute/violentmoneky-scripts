@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.8.5
+// @version      0.8.7
 // @description  Manually select Netflix subtitle languages; cache intercepted subtitle XML and display the latest two together.
 // @description:en Manually select Netflix subtitle languages; cache intercepted subtitle XML and display the latest two together.
 // @author       artsy-compute
@@ -47,6 +47,7 @@
         showStatus: false,
         hideNative: loadHideNativePreference(),
         requestedUrls: new Set(),
+        resourceObserverStarted: false,
         videoId: '',
         displayLangs: [],
         tracks: new Map(),
@@ -241,7 +242,12 @@
 
     function addStyles() {
         if (document.getElementById(STYLE_ID)) {
-            return;
+            return true;
+        }
+
+        const parent = document.head || document.documentElement;
+        if (!parent) {
+            return false;
         }
 
         const style = document.createElement('style');
@@ -318,12 +324,16 @@
                 transform: translateY(0);
             }
         `;
-        (document.head || document.documentElement).appendChild(style);
+        parent.appendChild(style);
+        return true;
     }
 
     function createOverlay() {
         if (state.root && document.documentElement.contains(state.root)) {
-            return;
+            return true;
+        }
+        if (!document.body) {
+            return false;
         }
 
         addStyles();
@@ -348,6 +358,7 @@
         state.textNode = textNode;
         state.statusNode = statusNode;
         state.toastNode = toastNode;
+        return true;
     }
 
     function getVideo() {
@@ -662,14 +673,22 @@
             performance.getEntriesByType('resource').forEach(inspect);
         } catch (_) {}
 
-        if (typeof PerformanceObserver === 'function') {
-            try {
-                new PerformanceObserver(list => list.getEntries().forEach(inspect)).observe({ type: 'resource', buffered: true });
-            } catch (_) {}
+        if (state.resourceObserverStarted || typeof PerformanceObserver !== 'function') {
+            return;
         }
+
+        try {
+            new PerformanceObserver(list => list.getEntries().forEach(inspect)).observe({ type: 'resource', buffered: true });
+            state.resourceObserverStarted = true;
+        } catch (_) {}
     }
 
     function injectNetworkBridge() {
+        const parent = document.head || document.documentElement;
+        if (!parent) {
+            return false;
+        }
+
         const script = document.createElement('script');
         script.textContent = '(' + function(eventName, maxChars) {
             const originalFetch = window.fetch;
@@ -725,8 +744,13 @@
                 XMLHttpRequest.prototype.send.__ndsPatched = true;
             }
         }.toString() + ')(' + JSON.stringify(BRIDGE_EVENT) + ',' + MAX_RESPONSE_CHARS + ');';
-        (document.head || document.documentElement).appendChild(script);
-        script.remove();
+        try {
+            parent.appendChild(script);
+            script.remove();
+            return true;
+        } catch (_) {
+            return false;
+        }
     }
 
     function sleep(ms) {
@@ -785,22 +809,33 @@
         GM_registerMenuCommand('Netflix Dual Subtitles: Clear cache', () => clearCachedTracks());
     }
 
-    function init() {
+    function ensureRuntimeReady() {
+        addStyles();
         injectNetworkBridge();
+        observeSubtitleRequests();
+        if (document.body) {
+            createOverlay();
+        }
+        render();
+    }
+
+    function init() {
         window.addEventListener(BRIDGE_EVENT, event => rememberPayload(event.detail.url, event.detail.payload));
         registerMenu();
         switchVideoContext(videoId(), true);
-        observeSubtitleRequests();
         watchVideoChanges();
+        ensureRuntimeReady();
 
         const startup = setInterval(() => {
-            if (document.body) {
-                createOverlay();
-                render();
+            ensureRuntimeReady();
+            if (document.body && state.root && document.documentElement.contains(state.root)) {
                 clearInterval(startup);
             }
         }, 50);
 
+        window.addEventListener('DOMContentLoaded', ensureRuntimeReady, { once: true });
+        window.addEventListener('load', ensureRuntimeReady, { once: true });
+        setInterval(ensureRuntimeReady, 1500);
         setInterval(render, RENDER_INTERVAL_MS);
     }
 
