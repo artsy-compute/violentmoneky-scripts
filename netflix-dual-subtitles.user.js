@@ -211,16 +211,25 @@
         return normalizeTrackKey(track.key || track.trackKey || track.lang || '');
     }
 
+    function cleanLanguageDisplayLabel(label, lang = '') {
+        const normalizedLang = normalizeLang(lang);
+        let text = normalizeNativeLabel(label || '');
+        if (normalizedLang) {
+            const escapedLang = normalizedLang.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            text = text
+                .replace(new RegExp('\\s*\\[' + escapedLang + '\\]\\s*$', 'i'), '')
+                .replace(new RegExp('\\s*\\(' + escapedLang + '\\)\\s*$', 'i'), '')
+                .trim();
+        }
+        return text;
+    }
+
     function trackDisplayLabel(track) {
         if (!track) {
             return '';
         }
-        const label = normalizeNativeLabel(track.label || track.displayName || '');
         const lang = normalizeLang(track.lang || '');
-        if (label && lang && !label.toLowerCase().includes(lang.toLowerCase())) {
-            return label + ' [' + lang + ']';
-        }
-        return label || lang || trackCacheKey(track);
+        return cleanLanguageDisplayLabel(track.label || track.displayName || '', lang) || lang || trackCacheKey(track);
     }
 
     function resolveTrackKey(value) {
@@ -778,21 +787,7 @@
         });
         selectorNode.addEventListener('mouseleave', () => {
             state.selectorHover = false;
-            setTimeout(() => {
-                if (!state.selectorNode) {
-                    return;
-                }
-                if (selectorNode.matches(':hover') || selectorNode.contains(document.activeElement)) {
-                    state.selectorHover = true;
-                    return;
-                }
-                if (state.selectorOpen) {
-                    state.selectorOpen = false;
-                    state.selectorSignature = '';
-                    renderSelector();
-                }
-                scheduleSelectorHide();
-            }, 180);
+            scheduleSelectorHide();
         });
         selectorNode.addEventListener('focusin', () => {
             state.selectorHover = true;
@@ -973,7 +968,7 @@
                 officialTrackKeys.add(cachedKey);
             }
             option.value = value;
-            option.textContent = nativeOption.label;
+            option.textContent = cleanLanguageDisplayLabel(nativeOption.label, nativeOption.lang) || nativeOption.label || nativeOption.lang || '';
             option.selected = pendingValue === value || !pendingValue && cachedKey && cachedKey === selected;
             select.appendChild(option);
         });
@@ -1009,7 +1004,7 @@
         }
         state.selectorHideTimer = setTimeout(() => {
             state.selectorHideTimer = null;
-            if (state.selectorHover || (state.selectorNode && (state.selectorNode.matches(':hover') || state.selectorNode.contains(document.activeElement)))) {
+            if (state.selectorOpen || state.selectorHover || (state.selectorNode && (state.selectorNode.matches(':hover') || state.selectorNode.contains(document.activeElement)))) {
                 return;
             }
             state.selectorVisible = false;
@@ -1023,6 +1018,35 @@
         state.selectorSignature = '';
         scheduleSelectorHide();
         renderSelector();
+    }
+
+    function closeSelectorPanel() {
+        if (!state.selectorOpen) {
+            return false;
+        }
+        state.selectorOpen = false;
+        state.selectorSignature = '';
+        renderSelector();
+        scheduleSelectorHide();
+        return true;
+    }
+
+    function handleSelectorOutsidePointer(event) {
+        if (!state.selectorOpen || !state.selectorNode) {
+            return;
+        }
+        const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+        if (path.includes(state.selectorNode) || state.selectorNode.contains(event.target)) {
+            return;
+        }
+        closeSelectorPanel();
+    }
+
+    function handleSelectorKeydown(event) {
+        if (event.key === 'Escape' && closeSelectorPanel()) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
     }
 
     function mountSelectorNode() {
@@ -1440,7 +1464,7 @@
         const trackId = String(track.id || track.trackId || track.Au || track.Ix || track.new_track_id || '');
         return {
             key: 'manifest:' + stableHash([state.videoId || videoId(), trackId, lang, label, urls[0]].join('|')),
-            label: label + (lang ? ' (' + lang + ')' : ''),
+            label: cleanLanguageDisplayLabel(label, lang) || lang || 'Unknown',
             lang,
             urls,
             sourceUrl,
@@ -2499,6 +2523,8 @@
 
         window.addEventListener('DOMContentLoaded', ensureRuntimeReady, { once: true });
         window.addEventListener('load', ensureRuntimeReady, { once: true });
+        document.addEventListener('pointerdown', handleSelectorOutsidePointer, true);
+        document.addEventListener('keydown', handleSelectorKeydown, true);
         ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'].forEach(eventName => {
             document.addEventListener(eventName, ensureRuntimeReady);
         });
