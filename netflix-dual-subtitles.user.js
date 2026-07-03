@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.10.4
+// @version      0.10.7
 // @description  Load Netflix subtitle languages from the manifest; fetch selected tracks by manifest URL and display two subtitles together.
 // @description:en Load Netflix subtitle languages from the manifest; fetch selected tracks by manifest URL and display two subtitles together.
 // @author       artsy-compute
@@ -62,6 +62,8 @@
         selectorSignature: '',
         nativeOptions: [],
         manifestOptions: [],
+        nativeScanInProgress: false,
+        nativeScanAttempted: false,
         prefetchQueue: [],
         prefetchActive: false,
         prefetchedOptionKeys: new Set(),
@@ -449,6 +451,8 @@
         state.manualDisplay = false;
         state.nativeOptions = [];
         state.manifestOptions = [];
+        state.nativeScanInProgress = false;
+        state.nativeScanAttempted = false;
         state.prefetchQueue = [];
         state.prefetchActive = false;
         state.prefetchedOptionKeys.clear();
@@ -694,6 +698,11 @@
         });
         selectorNode.addEventListener('mouseleave', () => {
             state.selectorHover = false;
+            if (state.selectorOpen) {
+                state.selectorOpen = false;
+                state.selectorSignature = '';
+                renderSelector();
+            }
             scheduleSelectorHide();
         });
         selectorNode.addEventListener('change', event => {
@@ -856,7 +865,7 @@
         }
         state.selectorHideTimer = setTimeout(() => {
             state.selectorHideTimer = null;
-            if (state.selectorOpen || state.selectorHover) {
+            if (state.selectorHover) {
                 return;
             }
             state.selectorVisible = false;
@@ -885,6 +894,8 @@
             state.displayLangs.join(','),
             JSON.stringify(state.pendingSlotValues),
             mergedNativeOptions().map(option => option.key + ':' + option.lang + ':' + ((option.urls || []).length)).join('|'),
+            state.nativeScanInProgress ? 'native-scan' : 'native-idle',
+            state.nativeScanAttempted ? 'native-tried' : 'native-untried',
             tracks.map(track => track.lang + ':' + track.cues.length + ':' + (track.savedAt || 0)).join('|')
         ].join('::');
         if (signature === state.selectorSignature) {
@@ -914,7 +925,11 @@
         if (!tracks.length && !officialOptions.length) {
             const empty = document.createElement('div');
             empty.className = 'nds-selector-empty';
-            empty.textContent = 'Waiting for Netflix subtitle languages from the playback manifest.';
+            empty.textContent = state.nativeScanInProgress ?
+                'Loading Netflix subtitle languages...' :
+                state.nativeScanAttempted ?
+                    'No Netflix subtitle languages detected yet.' :
+                    'Waiting for Netflix subtitle languages...';
             panel.appendChild(empty);
         }
         if (tracks.length || officialOptions.length) {
@@ -1911,12 +1926,27 @@
             notify(options.length ? 'Found ' + options.length + ' Netflix subtitle option(s)' : 'Waiting for Netflix subtitle manifest');
             return options;
         }
+        if (state.nativeScanInProgress) {
+            return options;
+        }
         if (!state.nativeOptions.length) {
-            const button = findNetflixSubtitleButton();
-            if (button) {
-                clickNativeElement(button);
-                await sleep(350);
-                collectNativeSubtitleOptions();
+            state.nativeScanInProgress = true;
+            state.nativeScanAttempted = true;
+            state.selectorSignature = '';
+            renderSelector();
+            try {
+                const button = findNetflixSubtitleButton();
+                if (button) {
+                    clickNativeElement(button);
+                    await sleep(350);
+                    if (subtitleListContainers().length) {
+                        collectNativeSubtitleOptions();
+                    }
+                }
+            } finally {
+                state.nativeScanInProgress = false;
+                state.selectorSignature = '';
+                renderSelector();
             }
         }
         options = mergedNativeOptions();
@@ -1924,13 +1954,26 @@
         return options;
     }
 
+    async function ensureNativeSubtitleMenuOpen() {
+        wakeNetflixControls();
+        if (subtitleListContainers().length) {
+            return true;
+        }
+        const button = findNetflixSubtitleButton();
+        if (!button) {
+            return false;
+        }
+        clickNativeElement(button);
+        await sleep(350);
+        return !!subtitleListContainers().length;
+    }
+
     function findNativeSubtitleOptionElement(option) {
         const key = option && option.key;
         if (!key) {
             return null;
         }
-        const containers = [...subtitleListContainers(), ...nativeMenuContainers()];
-        for (const container of containers) {
+        for (const container of subtitleListContainers()) {
             const found = subtitleSectionNodes(container)
                 .map(node => nativeOptionFromNode(node))
                 .find(item => item && item.key === key);
@@ -1966,10 +2009,11 @@
         state.selectorSignature = '';
         renderSelector();
 
-        await refreshNativeOptions(true);
+        await ensureNativeSubtitleMenuOpen();
+        collectNativeSubtitleOptions();
         const element = findNativeSubtitleOptionElement(option);
         if (!element) {
-            notify('Could not click Netflix option: ' + option.label);
+            notify('Subtitle option not available in Netflix menu: ' + option.label);
             return false;
         }
         clickNativeElement(element);
@@ -1990,6 +2034,8 @@
         state.manualDisplay = false;
         state.nativeOptions = [];
         state.manifestOptions = [];
+        state.nativeScanInProgress = false;
+        state.nativeScanAttempted = false;
         state.prefetchQueue = [];
         state.prefetchActive = false;
         state.prefetchedOptionKeys.clear();
