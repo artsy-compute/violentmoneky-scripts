@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.8.9
+// @version      0.9.1
 // @description  Manually select Netflix subtitle languages; cache intercepted subtitle XML and display the latest two together.
 // @description:en Manually select Netflix subtitle languages; cache intercepted subtitle XML and display the latest two together.
 // @author       artsy-compute
@@ -26,6 +26,7 @@
     const MAX_RESPONSE_CHARS = 4_000_000;
     const CACHE_VERSION = 3;
     const MAX_DISPLAY_LANGS = 2;
+    const SELECTOR_IDLE_HIDE_MS = 2600;
     const HIDE_NATIVE_PREF_KEY = 'netflix-dual-subtitles:hide-native';
 
     function loadHideNativePreference() {
@@ -51,10 +52,17 @@
         historyPatched: false,
         videoId: '',
         displayLangs: [],
+        manualDisplay: false,
+        selectorOpen: false,
+        selectorVisible: true,
+        selectorHover: false,
+        selectorHideTimer: null,
+        selectorSignature: '',
         tracks: new Map(),
         root: null,
         textNode: null,
         statusNode: null,
+        selectorNode: null,
         toastNode: null,
         toastTimer: null,
         lastText: '',
@@ -122,9 +130,22 @@
         } catch (_) {}
     }
 
+    function latestTrackLangs() {
+        return Array.from(state.tracks.values())
+            .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0))
+            .map(track => track.lang);
+    }
+
+    function setLatestDisplayLangs() {
+        state.manualDisplay = false;
+        state.displayLangs = latestTrackLangs().slice(0, MAX_DISPLAY_LANGS);
+        state.lastText = '';
+        state.selectorSignature = '';
+    }
+
     function promoteDisplayLang(lang) {
         const normalized = normalizeLang(lang);
-        if (!normalized) {
+        if (!normalized || state.manualDisplay) {
             return false;
         }
 
@@ -133,7 +154,29 @@
             .filter(item => state.tracks.has(item))
             .slice(0, MAX_DISPLAY_LANGS);
         state.lastText = '';
+        state.selectorSignature = '';
         return before !== state.displayLangs.join('\n');
+    }
+
+    function setDisplayRole(lang, role) {
+        const normalized = normalizeLang(lang);
+        if (!normalized || !state.tracks.has(normalized)) {
+            return;
+        }
+
+        state.manualDisplay = true;
+        const fallback = latestTrackLangs().filter(item => item !== normalized);
+        const current = state.displayLangs.filter(item => item !== normalized && state.tracks.has(item));
+        if (role === 'primary') {
+            const secondary = current[0] || fallback[0] || '';
+            state.displayLangs = [normalized, secondary].filter(Boolean).slice(0, MAX_DISPLAY_LANGS);
+        } else {
+            const primary = current[0] || fallback[0] || '';
+            state.displayLangs = [primary, normalized].filter(Boolean).slice(0, MAX_DISPLAY_LANGS);
+        }
+        state.lastText = '';
+        state.selectorSignature = '';
+        notify((role === 'primary' ? 'Primary' : 'Secondary') + ': ' + normalized);
     }
 
     function notify(message) {
@@ -208,10 +251,7 @@
             } catch (_) {}
         }
 
-        state.displayLangs = Array.from(state.tracks.values())
-            .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0))
-            .map(track => track.lang)
-            .slice(0, MAX_DISPLAY_LANGS);
+        setLatestDisplayLangs();
         saveLangIndex();
     }
 
@@ -226,6 +266,8 @@
         const prefix = cachePrefix();
         state.tracks.clear();
         state.displayLangs = [];
+        state.manualDisplay = false;
+        state.selectorSignature = '';
         try {
             const keys = [];
             for (let index = 0; index < localStorage.length; index += 1) {
@@ -324,6 +366,84 @@
                 opacity: 1;
                 transform: translateY(0);
             }
+            .nds-selector {
+                position: fixed;
+                right: max(14px, 2vw);
+                top: 34vh;
+                pointer-events: auto;
+                display: grid;
+                justify-items: end;
+                gap: 8px;
+                color: #fff;
+                font: 13px/1.35 Arial, sans-serif;
+                opacity: 1;
+                transform: translateX(0);
+                transition: opacity .18s ease, transform .18s ease;
+            }
+            .nds-selector.is-idle {
+                opacity: 0;
+                pointer-events: none;
+                transform: translateX(8px);
+            }
+            .nds-selector-toggle {
+                width: 42px;
+                height: 42px;
+                border: 1px solid rgba(255,255,255,.28);
+                border-radius: 999px;
+                background: rgba(18, 18, 18, .72);
+                color: #fff;
+                font: 700 13px/1 Arial, sans-serif;
+                cursor: pointer;
+            }
+            .nds-selector-panel {
+                width: min(320px, 84vw);
+                max-height: min(58vh, 420px);
+                overflow: auto;
+                padding: 10px;
+                border: 1px solid rgba(255,255,255,.18);
+                border-radius: 6px;
+                background: rgba(15, 15, 15, .86);
+                box-shadow: 0 12px 30px rgba(0,0,0,.36);
+                display: grid;
+                gap: 8px;
+            }
+            .nds-selector-title {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                color: #ddd;
+            }
+            .nds-selector-row {
+                display: grid;
+                grid-template-columns: minmax(64px, 1fr) auto auto;
+                align-items: center;
+                gap: 6px;
+            }
+            .nds-selector-lang {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .nds-selector-count {
+                color: #aaa;
+                font-size: 11px;
+            }
+            .nds-selector button {
+                border: 1px solid rgba(255,255,255,.22);
+                border-radius: 5px;
+                background: rgba(255,255,255,.08);
+                color: #fff;
+                padding: 6px 8px;
+                cursor: pointer;
+            }
+            .nds-selector button.is-active {
+                background: rgba(229, 9, 20, .82);
+                border-color: rgba(255,255,255,.38);
+            }
+            .nds-selector-empty {
+                color: #bbb;
+            }
         `;
         parent.appendChild(style);
         return true;
@@ -364,17 +484,57 @@
         const statusNode = document.createElement('div');
         statusNode.className = 'nds-status';
 
+        const selectorNode = document.createElement('div');
+        selectorNode.className = 'nds-selector';
+        selectorNode.addEventListener('mouseenter', () => {
+            state.selectorHover = true;
+            showSelectorChrome();
+        });
+        selectorNode.addEventListener('mouseleave', () => {
+            state.selectorHover = false;
+            scheduleSelectorHide();
+        });
+        selectorNode.addEventListener('click', event => {
+            const action = event.target && event.target.dataset ? event.target.dataset.action : '';
+            if (!action) {
+                return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            showSelectorChrome();
+            if (action === 'toggle-selector') {
+                state.selectorOpen = !state.selectorOpen;
+                state.selectorSignature = '';
+                if (!state.selectorOpen) {
+                    scheduleSelectorHide();
+                }
+                render();
+                return;
+            }
+            if (action === 'latest') {
+                setLatestDisplayLangs();
+                notify('Showing latest two captured languages');
+                return;
+            }
+            if (action === 'primary' || action === 'secondary') {
+                setDisplayRole(event.target.dataset.lang, action);
+            }
+        });
+
         const toastNode = document.createElement('div');
         toastNode.className = 'nds-toast';
 
         root.appendChild(textNode);
         root.appendChild(statusNode);
+        root.appendChild(selectorNode);
         root.appendChild(toastNode);
         parent.appendChild(root);
 
         state.root = root;
         state.textNode = textNode;
         state.statusNode = statusNode;
+        state.selectorNode = selectorNode;
+        state.selectorSignature = '';
         state.toastNode = toastNode;
         return true;
     }
@@ -396,6 +556,121 @@
         document.documentElement.classList.toggle('nds-hide-native-subtitles', state.hideNative);
     }
 
+    function appendSelectorButton(parent, label, action, lang, active) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        button.dataset.action = action;
+        if (lang) {
+            button.dataset.lang = lang;
+        }
+        if (active) {
+            button.className = 'is-active';
+        }
+        parent.appendChild(button);
+    }
+
+    function showSelectorChrome() {
+        if (state.selectorHideTimer) {
+            clearTimeout(state.selectorHideTimer);
+            state.selectorHideTimer = null;
+        }
+        if (!state.selectorVisible) {
+            state.selectorVisible = true;
+            state.selectorSignature = '';
+            render();
+        }
+    }
+
+    function scheduleSelectorHide() {
+        if (state.selectorHideTimer) {
+            clearTimeout(state.selectorHideTimer);
+        }
+        state.selectorHideTimer = setTimeout(() => {
+            state.selectorHideTimer = null;
+            if (state.selectorOpen || state.selectorHover) {
+                return;
+            }
+            state.selectorVisible = false;
+            state.selectorSignature = '';
+            render();
+        }, SELECTOR_IDLE_HIDE_MS);
+    }
+
+    function noteScreenActivity() {
+        state.selectorVisible = true;
+        state.selectorSignature = '';
+        scheduleSelectorHide();
+        renderSelector();
+    }
+
+    function renderSelector() {
+        if (!state.selectorNode) {
+            return;
+        }
+
+        const tracks = Array.from(state.tracks.values()).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+        const signature = [
+            state.selectorOpen ? 'open' : 'closed',
+            state.selectorVisible ? 'visible' : 'idle',
+            state.manualDisplay ? 'manual' : 'latest',
+            state.displayLangs.join(','),
+            tracks.map(track => track.lang + ':' + track.cues.length + ':' + (track.savedAt || 0)).join('|')
+        ].join('::');
+        if (signature === state.selectorSignature) {
+            return;
+        }
+        state.selectorSignature = signature;
+
+        const selector = state.selectorNode;
+        selector.classList.toggle('is-idle', !state.selectorVisible && !state.selectorOpen);
+        selector.textContent = '';
+        appendSelectorButton(selector, 'CC', 'toggle-selector', '', false);
+        selector.firstChild.className = 'nds-selector-toggle' + (state.selectorOpen ? ' is-active' : '');
+        selector.firstChild.title = 'Dual subtitle language selector';
+        if (!state.selectorOpen) {
+            return;
+        }
+
+        const panel = document.createElement('div');
+        panel.className = 'nds-selector-panel';
+
+        const title = document.createElement('div');
+        title.className = 'nds-selector-title';
+        const label = document.createElement('span');
+        label.textContent = state.manualDisplay ? 'Manual languages' : 'Latest two languages';
+        title.appendChild(label);
+        appendSelectorButton(title, 'Latest', 'latest', '', !state.manualDisplay);
+        panel.appendChild(title);
+
+        if (!tracks.length) {
+            const empty = document.createElement('div');
+            empty.className = 'nds-selector-empty';
+            empty.textContent = 'No cached subtitles for this episode yet';
+            panel.appendChild(empty);
+        }
+
+        tracks.forEach(track => {
+            const row = document.createElement('div');
+            row.className = 'nds-selector-row';
+
+            const lang = document.createElement('div');
+            lang.className = 'nds-selector-lang';
+            lang.textContent = track.lang;
+            const count = document.createElement('div');
+            count.className = 'nds-selector-count';
+            count.textContent = track.cues.length + ' cues';
+            lang.appendChild(count);
+            row.appendChild(lang);
+
+            appendSelectorButton(row, 'P', 'primary', track.lang, state.displayLangs[0] === track.lang);
+            appendSelectorButton(row, 'S', 'secondary', track.lang, state.displayLangs[1] === track.lang);
+            panel.appendChild(row);
+        });
+
+        selector.appendChild(panel);
+    }
+
     function render() {
         createOverlay();
         applyNativeSubtitleVisibility();
@@ -407,7 +682,8 @@
         state.root.classList.toggle('show-status', state.showStatus);
 
         const summary = state.displayLangs.map(lang => lang + ':' + (state.tracks.get(lang)?.cues.length || 0)).join(' ');
-        state.statusNode.textContent = state.status + ' | ' + summary + ' | video:' + videoId();
+        state.statusNode.textContent = state.status + ' | ' + (state.manualDisplay ? 'manual' : 'latest') + ' | ' + summary + ' | video:' + videoId();
+        renderSelector();
 
         if (!state.enabled) {
             state.textNode.textContent = '';
@@ -785,6 +1061,8 @@
         state.requestedUrls.clear();
         state.tracks.clear();
         state.displayLangs = [];
+        state.manualDisplay = false;
+        state.selectorSignature = '';
         state.lastText = '';
         state.ignoredPayloads = 0;
         removeLegacyGenericChineseCache();
@@ -830,8 +1108,10 @@
         }
 
         GM_registerMenuCommand('Netflix Dual Subtitles: Switch main/secondary', () => {
+            state.manualDisplay = true;
             state.displayLangs.reverse();
             state.lastText = '';
+            state.selectorSignature = '';
             render();
         });
         GM_registerMenuCommand('Netflix Dual Subtitles: Toggle native Netflix subtitles', () => {
@@ -862,6 +1142,10 @@
         checkWatchIdChange(true);
         watchVideoChanges();
         ensureRuntimeReady();
+        noteScreenActivity();
+        ['mousemove', 'pointermove', 'touchstart', 'keydown'].forEach(eventName => {
+            window.addEventListener(eventName, noteScreenActivity, { passive: true });
+        });
 
         const startup = setInterval(() => {
             ensureRuntimeReady();
