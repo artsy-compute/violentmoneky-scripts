@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.8.8
+// @version      0.8.9
 // @description  Manually select Netflix subtitle languages; cache intercepted subtitle XML and display the latest two together.
 // @description:en Manually select Netflix subtitle languages; cache intercepted subtitle XML and display the latest two together.
 // @author       artsy-compute
@@ -329,12 +329,29 @@
         return true;
     }
 
+    function fullscreenElement() {
+        return document.fullscreenElement ||
+            document.webkitFullscreenElement ||
+            document.mozFullScreenElement ||
+            document.msFullscreenElement ||
+            null;
+    }
+
+    function overlayParent() {
+        return fullscreenElement() || document.body || null;
+    }
+
     function createOverlay() {
-        if (state.root && document.documentElement.contains(state.root)) {
-            return true;
-        }
-        if (!document.body) {
+        const parent = overlayParent();
+        if (!parent) {
             return false;
+        }
+
+        if (state.root && document.documentElement.contains(state.root)) {
+            if (state.root.parentNode !== parent) {
+                parent.appendChild(state.root);
+            }
+            return true;
         }
 
         addStyles();
@@ -353,7 +370,7 @@
         root.appendChild(textNode);
         root.appendChild(statusNode);
         root.appendChild(toastNode);
-        (document.body || document.documentElement).appendChild(root);
+        parent.appendChild(root);
 
         state.root = root;
         state.textNode = textNode;
@@ -855,6 +872,9 @@
 
         window.addEventListener('DOMContentLoaded', ensureRuntimeReady, { once: true });
         window.addEventListener('load', ensureRuntimeReady, { once: true });
+        ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'].forEach(eventName => {
+            document.addEventListener(eventName, ensureRuntimeReady);
+        });
         setInterval(ensureRuntimeReady, 1500);
         setInterval(render, RENDER_INTERVAL_MS);
     }
