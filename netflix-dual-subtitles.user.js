@@ -2174,23 +2174,10 @@
     }
 
     function collectNativeAudioOptions() {
-        const options = [];
-        const seen = new Set();
-        const containers = audioListContainers();
-        for (const container of containers) {
-            for (const node of audioSectionNodes(container)) {
-                const option = nativeOptionFromNode(node, 'audio');
-                if (!option || seen.has(option.key)) {
-                    continue;
-                }
-                seen.add(option.key);
-                options.push({ key: option.key, label: option.label, lang: option.lang, source: 'native-audio' });
-            }
-            if (options.length) {
-                break;
-            }
-        }
-        state.nativeAudioOptions = options.sort((a, b) => a.label.localeCompare(b.label));
+        const options = nativeAudioCandidates()
+            .map(option => ({ key: option.key, label: option.label, lang: option.lang, source: 'native-audio' }))
+            .sort((a, b) => a.label.localeCompare(b.label));
+        state.nativeAudioOptions = options;
         state.selectorSignature = '';
         renderSelector();
         return mergedAudioOptions();
@@ -2279,25 +2266,40 @@
         return null;
     }
 
+    function nativeAudioCandidates() {
+        const candidates = [];
+        const seen = new Set();
+        const addNode = node => {
+            const option = nativeOptionFromNode(node, 'audio');
+            if (!option || seen.has(option.key)) {
+                return;
+            }
+            seen.add(option.key);
+            candidates.push(option);
+        };
+
+        for (const container of audioListContainers()) {
+            audioSectionNodes(container).forEach(addNode);
+        }
+        Array.from(document.querySelectorAll('li[data-uia^="audio-item-"], [data-uia^="audio-item-"]'))
+            .filter(visibleElement)
+            .forEach(addNode);
+        return candidates;
+    }
+
     function findNativeAudioOptionElement(option) {
         if (!option) {
             return null;
         }
-        const candidates = [];
-        for (const container of audioListContainers()) {
-            audioSectionNodes(container)
-                .map(node => nativeOptionFromNode(node, 'audio'))
-                .filter(Boolean)
-                .forEach(item => candidates.push(item));
-        }
-
+        const candidates = nativeAudioCandidates();
         const optionIdentity = audioLabelIdentity(option.label);
         const exact = candidates.find(item => item.key === option.key || audioLabelIdentity(item.label) === optionIdentity);
         if (exact) {
             return exact.element;
         }
 
-        const sameLang = option.lang ? candidates.filter(item => item.lang === option.lang) : [];
+        const targetLang = option.lang || langFromNativeLabel(option.label);
+        const sameLang = targetLang ? candidates.filter(item => item.lang === targetLang) : [];
         if (sameLang.length === 1) {
             return sameLang[0].element;
         }
