@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.8.7
+// @version      0.8.8
 // @description  Manually select Netflix subtitle languages; cache intercepted subtitle XML and display the latest two together.
 // @description:en Manually select Netflix subtitle languages; cache intercepted subtitle XML and display the latest two together.
 // @author       artsy-compute
 // @license      MIT
-// @match        https://www.netflix.com/watch/*
+// @match        https://www.netflix.com/*
 // @run-at       document-start
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
@@ -48,6 +48,7 @@
         hideNative: loadHideNativePreference(),
         requestedUrls: new Set(),
         resourceObserverStarted: false,
+        historyPatched: false,
         videoId: '',
         displayLangs: [],
         tracks: new Map(),
@@ -63,11 +64,11 @@
 
     function videoId() {
         const match = location.pathname.match(/\/watch\/(\d+)/);
-        return match ? match[1] : 'unknown';
+        return match ? match[1] : '';
     }
 
     function cachePrefix() {
-        return 'netflix-dual-subtitles:v' + CACHE_VERSION + ':' + (state.videoId || videoId()) + ':';
+        return 'netflix-dual-subtitles:v' + CACHE_VERSION + ':' + (state.videoId || videoId() || 'unknown') + ':';
     }
 
     function cacheKey(lang) {
@@ -758,8 +759,8 @@
     }
 
     function switchVideoContext(nextVideoId, initial = false) {
-        const normalizedVideoId = nextVideoId || 'unknown';
-        if (!initial && normalizedVideoId === state.videoId) {
+        const normalizedVideoId = String(nextVideoId || '');
+        if (!normalizedVideoId || (!initial && normalizedVideoId === state.videoId)) {
             return;
         }
 
@@ -778,13 +779,32 @@
         render();
     }
 
+    function checkWatchIdChange(initial = false) {
+        const currentVideoId = videoId();
+        if (currentVideoId && currentVideoId !== state.videoId) {
+            switchVideoContext(currentVideoId, initial && !state.videoId);
+            ensureRuntimeReady();
+        }
+    }
+
     function watchVideoChanges() {
-        setInterval(() => {
-            const currentVideoId = videoId();
-            if (currentVideoId !== state.videoId) {
-                switchVideoContext(currentVideoId);
-            }
-        }, 500);
+        if (!state.historyPatched) {
+            state.historyPatched = true;
+            ['pushState', 'replaceState'].forEach(method => {
+                const original = history[method];
+                if (typeof original !== 'function') {
+                    return;
+                }
+                history[method] = function() {
+                    const result = original.apply(this, arguments);
+                    setTimeout(() => checkWatchIdChange(), 0);
+                    return result;
+                };
+            });
+            window.addEventListener('popstate', () => setTimeout(() => checkWatchIdChange(), 0));
+        }
+
+        setInterval(() => checkWatchIdChange(), 250);
     }
 
     function registerMenu() {
@@ -822,7 +842,7 @@
     function init() {
         window.addEventListener(BRIDGE_EVENT, event => rememberPayload(event.detail.url, event.detail.payload));
         registerMenu();
-        switchVideoContext(videoId(), true);
+        checkWatchIdChange(true);
         watchVideoChanges();
         ensureRuntimeReady();
 
