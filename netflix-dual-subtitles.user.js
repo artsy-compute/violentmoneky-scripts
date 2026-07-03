@@ -273,12 +273,23 @@
 
     function mergedNativeOptions() {
         const merged = new Map();
-        [...state.manifestOptions, ...state.nativeOptions].forEach(option => {
-            if (option && option.key && !merged.has(option.key)) {
+        const nativeLangs = new Set(state.nativeOptions.map(option => normalizeLang(option && option.lang || '')).filter(Boolean));
+        state.nativeOptions.forEach(option => {
+            if (option && option.key) {
                 merged.set(option.key, option);
             }
         });
-        return Array.from(merged.values()).sort((a, b) => a.label.localeCompare(b.label));
+        state.manifestOptions.forEach(option => {
+            if (!option || !option.key) {
+                return;
+            }
+            const lang = normalizeLang(option.lang || '');
+            if (lang && nativeLangs.has(lang)) {
+                return;
+            }
+            merged.set(option.key, option);
+        });
+        return Array.from(merged.values()).sort((a, b) => cleanLanguageDisplayLabel(a.label, a.lang).localeCompare(cleanLanguageDisplayLabel(b.label, b.lang)));
     }
 
     function audioOptionIdentity(option) {
@@ -287,17 +298,23 @@
 
     function mergedAudioOptions() {
         const merged = new Map();
-        state.manifestAudioOptions.forEach(option => {
-            if (option && option.key) {
-                merged.set(audioOptionIdentity(option) || option.key, option);
-            }
-        });
+        const nativeLangs = new Set(state.nativeAudioOptions.map(option => normalizeLang(option && option.lang || '')).filter(Boolean));
         state.nativeAudioOptions.forEach(option => {
             if (option && option.key) {
-                merged.set(audioOptionIdentity(option) || option.key, option);
+                merged.set(option.key, option);
             }
         });
-        return Array.from(merged.values()).sort((a, b) => a.label.localeCompare(b.label));
+        state.manifestAudioOptions.forEach(option => {
+            if (!option || !option.key) {
+                return;
+            }
+            const lang = normalizeLang(option.lang || '');
+            if (lang && nativeLangs.has(lang)) {
+                return;
+            }
+            merged.set(option.key, option);
+        });
+        return Array.from(merged.values()).sort((a, b) => cleanLanguageDisplayLabel(a.label, a.lang).localeCompare(cleanLanguageDisplayLabel(b.label, b.lang)));
     }
 
     function cachedTrackKeyForOption(option) {
@@ -567,9 +584,9 @@
             html.nds-hide-native-subtitles .player-timedtext-text-container {
                 display: none !important;
             }
-            html.nds-addon-active div:has(> [data-uia="selector-audio-subtitle"]),
-            html.nds-addon-active div:has(> div > [data-uia="selector-audio-subtitle"]),
-            html.nds-addon-active [data-uia="selector-audio-subtitle"] {
+            html.nds-addon-active:not(.nds-native-selecting) div:has(> [data-uia="selector-audio-subtitle"]),
+            html.nds-addon-active:not(.nds-native-selecting) div:has(> div > [data-uia="selector-audio-subtitle"]),
+            html.nds-addon-active:not(.nds-native-selecting) [data-uia="selector-audio-subtitle"] {
                 opacity: 0 !important;
                 pointer-events: none !important;
             }
@@ -1985,6 +2002,19 @@
         return true;
     }
 
+    async function clickNativeMediaElement(element) {
+        if (!element) {
+            return false;
+        }
+        document.documentElement.classList.add('nds-native-selecting');
+        try {
+            await sleep(30);
+            return clickNativeElement(element);
+        } finally {
+            setTimeout(() => document.documentElement.classList.remove('nds-native-selecting'), 160);
+        }
+    }
+
     function wakeNetflixControls() {
         const target = getVideo() || document.querySelector('[data-uia="player"]') || document.body;
         if (!target) {
@@ -2306,7 +2336,7 @@
             audioSectionNodes(container).forEach(addNode);
         }
         Array.from(document.querySelectorAll('li[data-uia^="audio-item-"], [data-uia^="audio-item-"]'))
-            .filter(visibleElement)
+            .filter(node => !state.root || !state.root.contains(node))
             .forEach(addNode);
         return candidates;
     }
@@ -2360,7 +2390,7 @@
             notify('Audio option not available in Netflix menu: ' + option.label);
             return false;
         }
-        clickNativeElement(element);
+        await clickNativeMediaElement(element);
         state.selectedAudioKey = option.key;
         state.selectorSignature = '';
         renderSelector();
@@ -2400,7 +2430,7 @@
             notify('Subtitle option not available in Netflix menu: ' + option.label);
             return false;
         }
-        clickNativeElement(element);
+        await clickNativeMediaElement(element);
         notify('Selected Netflix subtitle: ' + option.label);
         return true;
     }
