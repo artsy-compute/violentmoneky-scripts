@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.13.15
+// @version      0.13.16
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -1280,9 +1280,10 @@
                 pointer-events: none;
             }
             .nds-selector-panel {
-                width: min(340px, 86vw);
-                max-height: min(58vh, 440px);
-                overflow: auto;
+                width: min(360px, 88vw);
+                max-height: min(82vh, calc(100vh - 120px));
+                overflow-y: auto;
+                overflow-x: hidden;
                 padding: 12px;
                 border: 0;
                 border-radius: 4px;
@@ -1364,7 +1365,7 @@
             }
             .nds-radio-list {
                 display: grid;
-                gap: 2px;
+                gap: 1px;
                 max-height: none;
                 overflow: visible;
                 padding: 1px 0;
@@ -1374,8 +1375,8 @@
                 grid-template-columns: 18px minmax(0, 1fr);
                 align-items: center;
                 gap: 8px;
-                min-height: 30px;
-                padding: 4px 7px;
+                min-height: 28px;
+                padding: 3px 7px;
                 border-radius: 3px;
                 color: #fff;
                 cursor: pointer;
