@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.13.6
+// @version      0.13.9
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -54,6 +54,8 @@
         controlObserverStarted: false,
         controlHoldRefreshScheduled: false,
         controlForcedStyles: new Map(),
+        controlForcedPlayerClasses: new Map(),
+        observedPlayers: new WeakSet(),
         historyPatched: false,
         videoId: '',
         displayLangs: [],
@@ -785,6 +787,7 @@
                 opacity: 0 !important;
                 pointer-events: none !important;
             }
+            html.nds-selector-attention [data-uia="player"],
             html.nds-selector-attention [class*="watch-video--bottom-controls-container"],
             html.nds-selector-attention div:has(> [data-uia="controls-standard"]),
             html.nds-selector-attention div:has([data-uia="controls-standard"]) {
@@ -1396,12 +1399,32 @@
         return !!(state.selectorOpen && state.selectorNode && state.selectorNode.querySelector('.nds-selector-panel'));
     }
 
+    function selectorDomIsVisible() {
+        const selector = state.selectorNode;
+        if (!selector || !document.documentElement.contains(selector)) {
+            return false;
+        }
+        if (state.selectorOpen || selector.querySelector('.nds-selector-panel')) {
+            return true;
+        }
+        if (selector.classList.contains('is-idle')) {
+            return false;
+        }
+        try {
+            const style = getComputedStyle(selector);
+            const rect = selector.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) > 0.01 && rect.width > 0 && rect.height > 0;
+        } catch (_) {
+            return !!state.selectorVisible;
+        }
+    }
+
     function selectorIsAppearing() {
-        return !!(state.selectorNode && (state.selectorVisible || state.selectorOpen));
+        return !!(state.selectorNode && (state.selectorVisible || state.selectorOpen || selectorDomIsVisible()));
     }
 
     function selectorShouldHoldNetflixControls() {
-        return !!(state.enabled && (selectorIsAppearing() || selectorPanelIsPresent() || selectorHasAttention()));
+        return !!(state.enabled && (selectorDomIsVisible() || selectorIsAppearing() || selectorPanelIsPresent() || selectorHasAttention()));
     }
 
     function netflixControlCandidateSelectors() {
@@ -1480,6 +1503,39 @@
         state.controlForcedStyles.clear();
     }
 
+    function forcePlayerActiveClass() {
+        document.querySelectorAll('[data-uia="player"]').forEach(player => {
+            if (!state.controlForcedPlayerClasses.has(player)) {
+                state.controlForcedPlayerClasses.set(player, {
+                    active: player.classList.contains('active'),
+                    inactive: player.classList.contains('inactive'),
+                    passive: player.classList.contains('passive')
+                });
+            }
+            player.classList.remove('inactive', 'passive');
+            player.classList.add('active');
+            player.setAttribute('data-nds-control-hold', 'active');
+        });
+    }
+
+    function restorePlayerStateClasses() {
+        state.controlForcedPlayerClasses.forEach((previous, player) => {
+            try {
+                if (player.getAttribute('data-nds-control-hold') !== 'active') {
+                    return;
+                }
+                player.classList.remove('active', 'inactive', 'passive');
+                ['active', 'inactive', 'passive'].forEach(className => {
+                    if (previous[className]) {
+                        player.classList.add(className);
+                    }
+                });
+                player.removeAttribute('data-nds-control-hold');
+            } catch (_) {}
+        });
+        state.controlForcedPlayerClasses.clear();
+    }
+
     function addNetflixControlForceTarget(targets, element) {
         if (element && element.nodeType === 1) {
             targets.add(element);
@@ -1488,7 +1544,7 @@
 
     function netflixControlForceTargets() {
         const targets = new Set();
-        document.querySelectorAll('[class*="watch-video--bottom-controls-container"], [data-uia="controls-standard"], [data-uia="timeline"], [data-uia^="control-"]').forEach(element => {
+        document.querySelectorAll('[data-uia="player"], [class*="watch-video--bottom-controls-container"], [data-uia="controls-standard"], [data-uia="timeline"], [data-uia^="control-"]').forEach(element => {
             addNetflixControlForceTarget(targets, element);
             let parent = element.parentElement;
             for (let depth = 0; parent && depth < 5; depth += 1) {
@@ -1536,6 +1592,7 @@
 
     function applyNetflixControlHold() {
         document.documentElement.classList.add('nds-selector-attention');
+        forcePlayerActiveClass();
         applyNetflixControlForceStyles();
         wakeNetflixControls();
     }
@@ -1543,6 +1600,7 @@
     function releaseNetflixControlHold() {
         document.documentElement.classList.remove('nds-selector-attention');
         restoreNetflixControlForceStyles();
+        restorePlayerStateClasses();
     }
 
     function scheduleNetflixControlHoldRefresh() {
@@ -1561,7 +1619,47 @@
         });
     }
 
+    function playerControlState(player) {
+        if (!player || !player.classList) {
+            return '';
+        }
+        if (player.classList.contains('active')) {
+            return 'active';
+        }
+        if (player.classList.contains('inactive')) {
+            return 'inactive';
+        }
+        return player.classList.contains('passive') ? 'passive' : '';
+    }
+
+    function handlePlayerControlStateChange(player) {
+        const playerState = playerControlState(player);
+        if ((playerState === 'inactive' || playerState === 'passive') && selectorShouldHoldNetflixControls()) {
+            scheduleNetflixControlHoldRefresh();
+        }
+    }
+
+    function observeNetflixPlayers() {
+        if (typeof MutationObserver !== 'function') {
+            return;
+        }
+        document.querySelectorAll('[data-uia="player"]').forEach(player => {
+            if (state.observedPlayers.has(player)) {
+                return;
+            }
+            state.observedPlayers.add(player);
+            try {
+                new MutationObserver(() => handlePlayerControlStateChange(player)).observe(player, {
+                    attributes: true,
+                    attributeFilter: ['class']
+                });
+                handlePlayerControlStateChange(player);
+            } catch (_) {}
+        });
+    }
+
     function observeNetflixControlVisibility() {
+        observeNetflixPlayers();
         if (state.controlObserverStarted || typeof MutationObserver !== 'function') {
             return;
         }
@@ -1571,6 +1669,7 @@
         }
         try {
             new MutationObserver(mutations => {
+                observeNetflixPlayers();
                 if (!selectorShouldHoldNetflixControls()) {
                     return;
                 }
