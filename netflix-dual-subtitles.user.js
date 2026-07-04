@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.13.23
+// @version      0.13.24
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -33,6 +33,7 @@
     const CUE_END_TOLERANCE_MS = 120;
     const HIDE_NATIVE_PREF_KEY = 'netflix-dual-subtitles:hide-native';
     const LANGUAGE_PREF_KEY = 'netflix-dual-subtitles:language-preferences:v1';
+    const TRANSCRIPT_OPACITY_PREF_KEY = 'netflix-dual-subtitles:transcript-opacity';
 
     function loadHideNativePreference() {
         try {
@@ -45,6 +46,28 @@
     function saveHideNativePreference(value) {
         try {
             localStorage.setItem(HIDE_NATIVE_PREF_KEY, value ? '1' : '0');
+        } catch (_) {}
+    }
+
+    function clampTranscriptOpacity(value) {
+        const opacity = Number(value);
+        if (!Number.isFinite(opacity)) {
+            return 0.35;
+        }
+        return Math.min(1, Math.max(0.35, opacity));
+    }
+
+    function loadTranscriptOpacityPreference() {
+        try {
+            return clampTranscriptOpacity(localStorage.getItem(TRANSCRIPT_OPACITY_PREF_KEY) || 0.35);
+        } catch (_) {
+            return 0.35;
+        }
+    }
+
+    function saveTranscriptOpacityPreference(value) {
+        try {
+            localStorage.setItem(TRANSCRIPT_OPACITY_PREF_KEY, String(clampTranscriptOpacity(value)));
         } catch (_) {}
     }
 
@@ -100,6 +123,7 @@
         transcriptNode: null,
         transcriptToggleNode: null,
         transcriptSignature: '',
+        transcriptOpacity: loadTranscriptOpacityPreference(),
         transcriptScrollToCurrent: false,
         transcriptLastCueIndex: -1,
         transcriptUserScrollUntil: 0,
@@ -1341,7 +1365,7 @@
                 gap: 10px;
                 padding: 12px;
                 border-radius: 4px;
-                background: rgba(20, 20, 20, .96);
+                background: rgba(20, 20, 20, var(--nds-transcript-opacity, .35));
                 box-shadow: 0 8px 24px rgba(0,0,0,.55);
                 color: #fff;
                 font: 13px/1.35 Arial, sans-serif;
@@ -1352,13 +1376,26 @@
                 display: grid;
             }
             .nds-transcript-title {
-                display: flex;
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) auto auto;
                 align-items: center;
-                justify-content: space-between;
                 gap: 10px;
                 color: #fff;
                 font-size: 14px;
                 font-weight: 700;
+            }
+            .nds-transcript-opacity {
+                display: grid;
+                grid-template-columns: auto 88px;
+                align-items: center;
+                gap: 7px;
+                color: #b3b3b3;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            .nds-transcript-opacity input {
+                width: 88px;
+                accent-color: #e50914;
             }
             .nds-transcript-close {
                 min-width: 32px;
@@ -1718,6 +1755,16 @@
             transcriptNode.addEventListener(eventName, event => {
                 event.stopPropagation();
             });
+        });
+        transcriptNode.addEventListener('input', event => {
+            const target = event.target;
+            if (!target || target.dataset.role !== 'transcript-opacity') {
+                return;
+            }
+            state.transcriptOpacity = clampTranscriptOpacity(target.value);
+            saveTranscriptOpacityPreference(state.transcriptOpacity);
+            state.transcriptNode.style.setProperty('--nds-transcript-opacity', String(state.transcriptOpacity));
+            state.transcriptSignature = '';
         });
         transcriptNode.addEventListener('click', event => {
             const actionNode = event.target && event.target.closest ? event.target.closest('[data-action]') : null;
@@ -2706,11 +2753,13 @@
         const secondaryTrack = state.tracks.get(state.displayLangs[1] || '');
         const signature = [
             state.transcriptOpen ? 'open' : 'closed',
+            state.transcriptOpacity,
             state.displayLangs.join(','),
             primaryTrack ? trackCacheKey(primaryTrack) + ':' + primaryTrack.cues.length + ':' + (primaryTrack.savedAt || 0) : '',
             secondaryTrack ? trackCacheKey(secondaryTrack) + ':' + secondaryTrack.cues.length + ':' + (secondaryTrack.savedAt || 0) : ''
         ].join('::');
         const controlsVisible = state.bottomControlsVisible && netflixBottomControlsVisibleNow();
+        state.transcriptNode.style.setProperty('--nds-transcript-opacity', String(state.transcriptOpacity));
         state.transcriptToggleNode.classList.toggle('is-active', state.transcriptOpen);
         state.transcriptToggleNode.classList.toggle('is-hidden', !controlsVisible && !state.transcriptOpen);
         state.transcriptNode.classList.toggle('is-open', state.transcriptOpen);
@@ -2728,12 +2777,27 @@
         title.className = 'nds-transcript-title';
         const titleText = document.createElement('div');
         titleText.textContent = 'Transcript';
+        const opacityLabel = document.createElement('label');
+        opacityLabel.className = 'nds-transcript-opacity';
+        const opacityText = document.createElement('span');
+        opacityText.textContent = 'Opacity';
+        const opacityInput = document.createElement('input');
+        opacityInput.type = 'range';
+        opacityInput.min = '0.35';
+        opacityInput.max = '1';
+        opacityInput.step = '0.05';
+        opacityInput.value = String(state.transcriptOpacity);
+        opacityInput.dataset.role = 'transcript-opacity';
+        opacityLabel.appendChild(opacityText);
+        opacityLabel.appendChild(opacityInput);
+
         const closeButton = document.createElement('button');
         closeButton.type = 'button';
         closeButton.className = 'nds-transcript-close';
         closeButton.dataset.action = 'close-transcript';
         closeButton.textContent = 'Close';
         title.appendChild(titleText);
+        title.appendChild(opacityLabel);
         title.appendChild(closeButton);
         state.transcriptNode.appendChild(title);
 
