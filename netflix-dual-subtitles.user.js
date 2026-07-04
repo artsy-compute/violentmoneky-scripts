@@ -951,13 +951,14 @@
             .nds-toast {
                 position: fixed;
                 top: max(24px, calc(env(safe-area-inset-top) + 24px));
-                left: max(24px, calc(env(safe-area-inset-left) + 24px));
-                max-width: min(360px, calc(100vw - 96px));
+                right: max(32px, calc(env(safe-area-inset-right) + 32px));
+                max-width: min(360px, calc(100vw - 64px));
                 padding: 10px 12px;
                 border-radius: 6px;
                 background: rgba(18, 18, 18, .88);
                 color: #fff;
                 font: 13px/1.35 Arial, sans-serif;
+                text-align: right;
                 box-shadow: 0 10px 28px rgba(0, 0, 0, .32);
                 opacity: 0;
                 transform: translateY(-6px);
