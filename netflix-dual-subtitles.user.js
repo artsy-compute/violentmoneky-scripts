@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.13.12
+// @version      0.13.13
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -29,6 +29,8 @@
     const MANIFEST_SCAN_LIMIT = 50000;
     const SELECTOR_IDLE_HIDE_MS = 2600;
     const PREFETCH_DELAY_MS = 140;
+    const CUE_START_TOLERANCE_MS = 80;
+    const CUE_END_TOLERANCE_MS = 120;
     const HIDE_NATIVE_PREF_KEY = 'netflix-dual-subtitles:hide-native';
 
     function loadHideNativePreference() {
@@ -92,6 +94,7 @@
         toastNode: null,
         toastTimer: null,
         controlWakeNudge: 0,
+        subtitleRenderScheduled: false,
         lastText: '',
         status: 'manual mode: select audio/subtitle languages',
         ignoredPayloads: 0
@@ -617,10 +620,27 @@
             .filter(Boolean);
     }
 
+    function invalidateSubtitleRender() {
+        state.lastText = null;
+    }
+
+    function scheduleSubtitleRender() {
+        invalidateSubtitleRender();
+        if (state.subtitleRenderScheduled) {
+            return;
+        }
+        state.subtitleRenderScheduled = true;
+        const schedule = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : callback => setTimeout(callback, 16);
+        schedule(() => {
+            state.subtitleRenderScheduled = false;
+            render();
+        });
+    }
+
     function setLatestDisplayLangs() {
         state.manualDisplay = false;
         state.displayLangs = latestTrackKeys().slice(0, MAX_DISPLAY_LANGS);
-        state.lastText = '';
+        invalidateSubtitleRender();
         state.selectorSignature = '';
     }
 
@@ -634,7 +654,7 @@
         state.displayLangs = [key, ...state.displayLangs.filter(item => item !== key)]
             .filter(item => state.tracks.has(item))
             .slice(0, MAX_DISPLAY_LANGS);
-        state.lastText = '';
+        invalidateSubtitleRender();
         state.selectorSignature = '';
         return before !== state.displayLangs.join('\n');
     }
@@ -654,7 +674,7 @@
         }
 
         state.displayLangs = next.filter((item, itemIndex, array) => item && array.indexOf(item) === itemIndex).slice(0, MAX_DISPLAY_LANGS);
-        state.lastText = '';
+        scheduleSubtitleRender();
         state.selectorSignature = '';
         delete state.pendingSlotValues[index === 0 ? 'primary' : 'secondary'];
         notify((index === 0 ? 'Primary' : 'Secondary') + ': ' + (key ? trackDisplayLabel(state.tracks.get(key)) : 'off'));
@@ -746,7 +766,7 @@
             promoteDisplayLang(key);
         } else if (!state.manualDisplay && state.displayLangs.length < MAX_DISPLAY_LANGS && !state.displayLangs.includes(key)) {
             state.displayLangs = [...state.displayLangs, key].slice(0, MAX_DISPLAY_LANGS);
-            state.lastText = '';
+            invalidateSubtitleRender();
             state.selectorSignature = '';
         }
 
@@ -764,6 +784,9 @@
         } else {
             state.status = 'cached ' + state.tracks.size + ' subtitle track(s)';
             render();
+        }
+        if (state.displayLangs.includes(key)) {
+            scheduleSubtitleRender();
         }
         return true;
     }
@@ -1279,11 +1302,31 @@
     }
 
     function cueAt(track, timeMs) {
-        if (!track) {
+        if (!track || !Array.isArray(track.cues) || !Number.isFinite(timeMs)) {
             return null;
         }
 
-        return track.cues.find(cue => timeMs >= cue.start - 80 && timeMs <= cue.end + 500) || null;
+        let low = 0;
+        let high = track.cues.length - 1;
+        let candidateIndex = -1;
+        while (low <= high) {
+            const middle = Math.floor((low + high) / 2);
+            const cue = track.cues[middle];
+            if (cue.start - CUE_START_TOLERANCE_MS <= timeMs) {
+                candidateIndex = middle;
+                low = middle + 1;
+            } else {
+                high = middle - 1;
+            }
+        }
+
+        for (let index = candidateIndex; index >= 0; index -= 1) {
+            const cue = track.cues[index];
+            if (timeMs >= cue.start - CUE_START_TOLERANCE_MS && timeMs <= cue.end + CUE_END_TOLERANCE_MS) {
+                return cue;
+            }
+        }
+        return null;
     }
 
     function clearSubtitleOverlay() {
