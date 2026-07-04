@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.13.16
+// @version      0.13.23
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -96,6 +96,14 @@
         selectorMount: '',
         selectorPanelScrollTop: 0,
         selectorPanelScrollLeft: 0,
+        transcriptOpen: false,
+        transcriptNode: null,
+        transcriptToggleNode: null,
+        transcriptSignature: '',
+        transcriptScrollToCurrent: false,
+        transcriptLastCueIndex: -1,
+        transcriptUserScrollUntil: 0,
+        transcriptProgrammaticScroll: false,
         toastNode: null,
         toastTimer: null,
         controlWakeNudge: 0,
@@ -938,6 +946,25 @@
         render();
     }
 
+    function seekToCueTime(value) {
+        const timeMs = Number(value);
+        const video = getVideo();
+        if (!video || !Number.isFinite(timeMs)) {
+            return false;
+        }
+        video.currentTime = Math.max(0, timeMs / 1000);
+        scheduleSubtitleRender();
+        return true;
+    }
+
+    function formatCueTime(timeMs) {
+        const totalSeconds = Math.max(0, Math.floor(Number(timeMs || 0) / 1000));
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor(totalSeconds % 3600 / 60);
+        const seconds = totalSeconds % 60;
+        return (hours ? hours + ':' + String(minutes).padStart(2, '0') : String(minutes)) + ':' + String(seconds).padStart(2, '0');
+    }
+
     function clearPendingSubtitleSlot(slot, option = null) {
         delete state.pendingSlotValues[slot];
         if (option && option.lang) {
@@ -1279,6 +1306,69 @@
                 height: 30px;
                 pointer-events: none;
             }
+            .nds-transcript-toggle {
+                position: fixed;
+                top: max(124px, calc(env(safe-area-inset-top) + 124px));
+                right: max(32px, calc(env(safe-area-inset-right) + 32px));
+                width: 42px;
+                height: 42px;
+                border: 1px solid rgba(255,255,255,.28);
+                border-radius: 999px;
+                background: rgba(18, 18, 18, .72);
+                color: #fff;
+                font: 800 13px/1 Arial, sans-serif;
+                cursor: pointer;
+                pointer-events: auto;
+                z-index: 2147483647;
+            }
+            .nds-transcript-toggle.is-hidden {
+                opacity: 0;
+                pointer-events: none;
+                transform: translateX(8px);
+            }
+            .nds-transcript-toggle.is-active {
+                background: rgba(229, 9, 20, .82);
+                border-color: rgba(255,255,255,.38);
+            }
+            .nds-transcript-window {
+                position: fixed;
+                top: max(176px, calc(env(safe-area-inset-top) + 176px));
+                right: max(32px, calc(env(safe-area-inset-right) + 32px));
+                width: min(720px, calc(100vw - 64px));
+                max-height: min(76vh, calc(100vh - 208px));
+                display: none;
+                grid-template-rows: auto minmax(0, 1fr);
+                gap: 10px;
+                padding: 12px;
+                border-radius: 4px;
+                background: rgba(20, 20, 20, .96);
+                box-shadow: 0 8px 24px rgba(0,0,0,.55);
+                color: #fff;
+                font: 13px/1.35 Arial, sans-serif;
+                pointer-events: auto;
+                z-index: 2147483647;
+            }
+            .nds-transcript-window.is-open {
+                display: grid;
+            }
+            .nds-transcript-title {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                color: #fff;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            .nds-transcript-close {
+                min-width: 32px;
+                height: 30px;
+                border: 1px solid rgba(255,255,255,.22);
+                border-radius: 4px;
+                background: rgba(255,255,255,.08);
+                color: #fff;
+                cursor: pointer;
+            }
             .nds-selector-panel {
                 width: min(360px, 88vw);
                 max-height: min(82vh, calc(100vh - 120px));
@@ -1419,6 +1509,65 @@
                 cursor: default;
                 opacity: .38;
             }
+            .nds-transcript-block {
+                display: grid;
+                grid-template-rows: auto minmax(0, 1fr);
+                gap: 6px;
+                min-height: 0;
+            }
+            .nds-transcript-heading {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+                gap: 8px;
+                color: #b3b3b3;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            .nds-transcript-list {
+                display: grid;
+                gap: 2px;
+                min-height: 180px;
+                max-height: min(62vh, 620px);
+                overflow-y: auto;
+                overflow-x: hidden;
+                overscroll-behavior: contain;
+                align-self: stretch;
+                padding-right: 3px;
+            }
+            .nds-transcript-row {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+                gap: 8px;
+                width: 100%;
+                min-height: 34px;
+                padding: 6px 7px;
+                border: 0;
+                border-radius: 3px;
+                background: rgba(255,255,255,.055);
+                color: #fff;
+                text-align: left;
+                cursor: pointer;
+            }
+            .nds-transcript-row:hover,
+            .nds-transcript-row:focus {
+                background: rgba(255,255,255,.13);
+            }
+            .nds-transcript-row.is-current {
+                background: rgba(229, 9, 20, .24);
+                box-shadow: inset 3px 0 0 #e50914;
+            }
+            .nds-transcript-cell {
+                min-width: 0;
+                overflow-wrap: anywhere;
+                font-size: 12px;
+                line-height: 1.25;
+            }
+            .nds-transcript-time {
+                color: #aaa;
+                font-size: 11px;
+                font-weight: 700;
+                margin-right: 5px;
+            }
             .nds-selector-empty {
                 color: #b3b3b3;
                 font-size: 13px;
@@ -1546,12 +1695,57 @@
             }
         });
 
+        const transcriptToggleNode = document.createElement('button');
+        transcriptToggleNode.type = 'button';
+        transcriptToggleNode.className = 'nds-transcript-toggle';
+        transcriptToggleNode.textContent = 'TXT';
+        transcriptToggleNode.title = 'Subtitle transcript';
+        transcriptToggleNode.setAttribute('aria-label', 'Subtitle transcript');
+        transcriptToggleNode.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            state.transcriptOpen = !state.transcriptOpen;
+            if (state.transcriptOpen) {
+                state.transcriptScrollToCurrent = true;
+            }
+            state.transcriptSignature = '';
+            renderTranscript();
+        });
+
+        const transcriptNode = document.createElement('div');
+        transcriptNode.className = 'nds-transcript-window';
+        ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu'].forEach(eventName => {
+            transcriptNode.addEventListener(eventName, event => {
+                event.stopPropagation();
+            });
+        });
+        transcriptNode.addEventListener('click', event => {
+            const actionNode = event.target && event.target.closest ? event.target.closest('[data-action]') : null;
+            const action = actionNode && actionNode.dataset ? actionNode.dataset.action : '';
+            if (!action || !transcriptNode.contains(actionNode)) {
+                return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            if (action === 'close-transcript') {
+                state.transcriptOpen = false;
+                state.transcriptSignature = '';
+                renderTranscript();
+                return;
+            }
+            if (action === 'seek-cue') {
+                seekToCueTime(actionNode.dataset ? actionNode.dataset.timeMs : '');
+            }
+        });
+
         const toastNode = document.createElement('div');
         toastNode.className = 'nds-toast';
 
         root.appendChild(textNode);
         root.appendChild(statusNode);
         root.appendChild(selectorNode);
+        root.appendChild(transcriptToggleNode);
+        root.appendChild(transcriptNode);
         root.appendChild(toastNode);
         parent.appendChild(root);
 
@@ -1559,7 +1753,10 @@
         state.textNode = textNode;
         state.statusNode = statusNode;
         state.selectorNode = selectorNode;
+        state.transcriptToggleNode = transcriptToggleNode;
+        state.transcriptNode = transcriptNode;
         state.selectorSignature = '';
+        state.transcriptSignature = '';
         state.toastNode = toastNode;
         return true;
     }
@@ -1710,6 +1907,138 @@
         row.appendChild(button);
 
         parent.appendChild(row);
+    }
+
+    function transcriptCurrentCueIndex(track) {
+        const video = getVideo();
+        if (!track || !Array.isArray(track.cues) || !track.cues.length || !video) {
+            return -1;
+        }
+        const timeMs = video.currentTime * 1000;
+        const active = cueAt(track, timeMs);
+        if (active && active.text) {
+            return track.cues.indexOf(active);
+        }
+        const nextIndex = track.cues.findIndex(cue => cue && cue.text && cue.start >= timeMs);
+        if (nextIndex !== -1) {
+            return nextIndex;
+        }
+        for (let index = track.cues.length - 1; index >= 0; index -= 1) {
+            if (track.cues[index] && track.cues[index].text) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    function updateTranscriptPointer() {
+        const panel = state.transcriptNode;
+        const primaryTrack = state.tracks.get(state.displayLangs[0] || '');
+        if (!state.transcriptOpen || !panel || !primaryTrack) {
+            return false;
+        }
+        const currentCueIndex = transcriptCurrentCueIndex(primaryTrack);
+        if (currentCueIndex < 0) {
+            panel.querySelectorAll('.nds-transcript-row.is-current').forEach(row => row.classList.remove('is-current'));
+            state.transcriptLastCueIndex = -1;
+            return false;
+        }
+        const nextRow = panel.querySelector('.nds-transcript-row[data-cue-index="' + currentCueIndex + '"]');
+        if (!nextRow) {
+            return false;
+        }
+        const changed = state.transcriptLastCueIndex !== currentCueIndex || !nextRow.classList.contains('is-current');
+        if (changed) {
+            panel.querySelectorAll('.nds-transcript-row.is-current').forEach(row => row.classList.remove('is-current'));
+            nextRow.classList.add('is-current');
+            state.transcriptLastCueIndex = currentCueIndex;
+        }
+        if ((changed || state.transcriptScrollToCurrent) && Date.now() >= state.transcriptUserScrollUntil) {
+            scrollTranscriptToCurrent();
+        }
+        return true;
+    }
+
+    function scrollTranscriptToCurrent() {
+        const panel = state.transcriptNode;
+        const list = panel && panel.querySelector('.nds-transcript-list');
+        const row = list && list.querySelector('.nds-transcript-row.is-current');
+        if (!list || !row) {
+            return false;
+        }
+        const targetTop = row.offsetTop - list.offsetTop - list.clientHeight * 0.35;
+        state.transcriptProgrammaticScroll = true;
+        list.scrollTop = Math.max(0, targetTop);
+        setTimeout(() => {
+            state.transcriptProgrammaticScroll = false;
+        }, 0);
+        return true;
+    }
+
+    function appendTranscriptCell(row, className, text, timeMs = null) {
+        const cell = document.createElement('div');
+        cell.className = 'nds-transcript-cell ' + className;
+        if (timeMs !== null) {
+            const time = document.createElement('span');
+            time.className = 'nds-transcript-time';
+            time.textContent = formatCueTime(timeMs);
+            cell.appendChild(time);
+        }
+        cell.appendChild(document.createTextNode(text || ''));
+        row.appendChild(cell);
+    }
+
+    function appendSubtitleTranscript(parent) {
+        const primaryTrack = state.tracks.get(state.displayLangs[0] || '');
+        if (!primaryTrack || !Array.isArray(primaryTrack.cues) || !primaryTrack.cues.length) {
+            return;
+        }
+        const secondaryTrack = state.tracks.get(state.displayLangs[1] || '');
+
+        const block = document.createElement('div');
+        block.className = 'nds-transcript-block';
+
+        const heading = document.createElement('div');
+        heading.className = 'nds-transcript-heading';
+        const primaryHeading = document.createElement('div');
+        primaryHeading.textContent = trackDisplayLabel(primaryTrack) || 'Primary';
+        const secondaryHeading = document.createElement('div');
+        secondaryHeading.textContent = secondaryTrack ? trackDisplayLabel(secondaryTrack) : 'Secondary';
+        heading.appendChild(primaryHeading);
+        heading.appendChild(secondaryHeading);
+        block.appendChild(heading);
+
+        const list = document.createElement('div');
+        list.className = 'nds-transcript-list';
+        list.addEventListener('wheel', () => {
+            state.transcriptUserScrollUntil = Date.now() + 4000;
+        }, { passive: true });
+        list.addEventListener('scroll', () => {
+            if (!state.transcriptProgrammaticScroll) {
+                state.transcriptUserScrollUntil = Date.now() + 4000;
+            }
+        }, { passive: true });
+        const fragment = document.createDocumentFragment();
+        const currentCueIndex = transcriptCurrentCueIndex(primaryTrack);
+        primaryTrack.cues.forEach((cue, cueIndex) => {
+            if (!cue || !cue.text) {
+                return;
+            }
+            const row = document.createElement('button');
+            row.type = 'button';
+            row.className = 'nds-transcript-row' + (cueIndex === currentCueIndex ? ' is-current' : '');
+            row.dataset.action = 'seek-cue';
+            row.dataset.cueIndex = String(cueIndex);
+            row.dataset.timeMs = String(Math.max(0, cue.start || 0));
+            row.title = 'Jump to ' + formatCueTime(cue.start);
+            const secondaryCue = secondaryTrack ? cueAt(secondaryTrack, cue.start + 1) : null;
+            appendTranscriptCell(row, 'is-primary', cue.text, cue.start);
+            appendTranscriptCell(row, 'is-secondary', secondaryCue && secondaryCue.text || '');
+            fragment.appendChild(row);
+        });
+        list.appendChild(fragment);
+        block.appendChild(list);
+        parent.appendChild(block);
     }
 
     function appendPickerBlock(parent, title, role, options) {
@@ -2369,6 +2698,59 @@
         panel.scrollLeft = state.selectorPanelScrollLeft || 0;
     }
 
+    function renderTranscript() {
+        if (!state.transcriptNode || !state.transcriptToggleNode) {
+            return;
+        }
+        const primaryTrack = state.tracks.get(state.displayLangs[0] || '');
+        const secondaryTrack = state.tracks.get(state.displayLangs[1] || '');
+        const signature = [
+            state.transcriptOpen ? 'open' : 'closed',
+            state.displayLangs.join(','),
+            primaryTrack ? trackCacheKey(primaryTrack) + ':' + primaryTrack.cues.length + ':' + (primaryTrack.savedAt || 0) : '',
+            secondaryTrack ? trackCacheKey(secondaryTrack) + ':' + secondaryTrack.cues.length + ':' + (secondaryTrack.savedAt || 0) : ''
+        ].join('::');
+        const controlsVisible = state.bottomControlsVisible && netflixBottomControlsVisibleNow();
+        state.transcriptToggleNode.classList.toggle('is-active', state.transcriptOpen);
+        state.transcriptToggleNode.classList.toggle('is-hidden', !controlsVisible && !state.transcriptOpen);
+        state.transcriptNode.classList.toggle('is-open', state.transcriptOpen);
+        if (signature === state.transcriptSignature) {
+            return;
+        }
+        state.transcriptSignature = signature;
+        state.transcriptNode.textContent = '';
+        if (!state.transcriptOpen) {
+            state.transcriptLastCueIndex = -1;
+            return;
+        }
+
+        const title = document.createElement('div');
+        title.className = 'nds-transcript-title';
+        const titleText = document.createElement('div');
+        titleText.textContent = 'Transcript';
+        const closeButton = document.createElement('button');
+        closeButton.type = 'button';
+        closeButton.className = 'nds-transcript-close';
+        closeButton.dataset.action = 'close-transcript';
+        closeButton.textContent = 'Close';
+        title.appendChild(titleText);
+        title.appendChild(closeButton);
+        state.transcriptNode.appendChild(title);
+
+        if (!primaryTrack) {
+            const empty = document.createElement('div');
+            empty.className = 'nds-selector-empty';
+            empty.textContent = 'Select a primary subtitle to show the transcript.';
+            state.transcriptNode.appendChild(empty);
+            return;
+        }
+        appendSubtitleTranscript(state.transcriptNode);
+        updateTranscriptPointer();
+        if (state.transcriptScrollToCurrent && scrollTranscriptToCurrent()) {
+            state.transcriptScrollToCurrent = false;
+        }
+    }
+
     function renderSelector() {
         if (!state.selectorNode) {
             return;
@@ -2462,6 +2844,8 @@
         }).join(' ');
         state.statusNode.textContent = state.status + ' | ' + (state.manualDisplay ? 'manual' : 'latest') + ' | ' + summary + ' | video:' + videoId();
         renderSelector();
+        renderTranscript();
+        updateTranscriptPointer();
 
         if (!state.enabled || !state.displayLangs.length) {
             clearSubtitleOverlay();
