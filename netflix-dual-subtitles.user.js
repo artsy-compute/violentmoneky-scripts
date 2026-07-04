@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.11.0
+// @version      0.11.3
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -24,7 +24,7 @@
     const BRIDGE_EVENT = 'netflix-dual-subtitles:response';
     const RENDER_INTERVAL_MS = 100;
     const MAX_RESPONSE_CHARS = 4_000_000;
-    const CACHE_VERSION = 3;
+    const CACHE_VERSION = 5;
     const MAX_DISPLAY_LANGS = 2;
     const MANIFEST_SCAN_LIMIT = 50000;
     const SELECTOR_IDLE_HIDE_MS = 2600;
@@ -90,8 +90,12 @@
         return match ? match[1] : '';
     }
 
+    function currentContextVideoId() {
+        return videoId() || state.videoId || '';
+    }
+
     function cachePrefix() {
-        return 'netflix-dual-subtitles:v' + CACHE_VERSION + ':' + (state.videoId || videoId() || 'unknown') + ':';
+        return 'netflix-dual-subtitles:v' + CACHE_VERSION + ':' + (currentContextVideoId() || 'unknown') + ':';
     }
 
     function cacheKey(lang) {
@@ -116,6 +120,40 @@
 
     function optionLabelIdentity(label) {
         return nativeLabelKey(String(label || '').replace(/\s*\(([a-z]{2,3}(?:[-_][a-z0-9]+)*)(?:\s*,[^)]*)?\)\s*$/i, ''));
+    }
+
+    function isCcSubtitleLabel(label) {
+        return /\bCC\b|closed captions?|字幕.*CC/i.test(normalizeNativeLabel(label));
+    }
+
+    function subtitleBaseLabelIdentity(label) {
+        return optionLabelIdentity(label)
+            .replace(/\s*[\[(（]\s*(?:cc|closed captions?)\s*[\])）]\s*/gi, ' ')
+            .replace(/\s*(?:[-–—:：]|,|，)\s*(?:cc|closed captions?).*$/i, '')
+            .replace(/\bCC\b/gi, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function subtitleVariantScore(option) {
+        const label = normalizeNativeLabel(option && option.label || '');
+        const base = subtitleBaseLabelIdentity(label);
+        let score = base.length || label.length || 999;
+        if (/forced|signs?|songs?|forced narrative|強制|標誌|歌曲/i.test(label)) {
+            score += 100;
+        }
+        return score;
+    }
+
+    function singleBestSubtitleVariant(options) {
+        if (!options.length) {
+            return null;
+        }
+        const sorted = options.slice().sort((a, b) => subtitleVariantScore(a) - subtitleVariantScore(b) || a.label.localeCompare(b.label));
+        if (sorted.length === 1 || subtitleVariantScore(sorted[0]) < subtitleVariantScore(sorted[1])) {
+            return sorted[0];
+        }
+        return null;
     }
 
     function audioLabelIdentity(label) {
@@ -328,7 +366,40 @@
             option.key && track.optionKey === option.key ||
             option.urls && option.urls.some(url => url && url === track.sourceUrl)
         );
-        return match ? trackCacheKey(match) : '';
+        if (match) {
+            return trackCacheKey(match);
+        }
+        const optionLang = normalizeLang(option.lang || '');
+        if (optionLang) {
+            const sameLang = Array.from(state.tracks.values()).filter(track => normalizeLang(track.lang || '') === optionLang);
+            if (sameLang.length === 1) {
+                return trackCacheKey(sameLang[0]);
+            }
+            const sameLabel = sameLang.find(track => optionLabelIdentity(trackDisplayLabel(track)) === optionLabelIdentity(option.label));
+            if (sameLabel) {
+                return trackCacheKey(sameLabel);
+            }
+        }
+        return '';
+    }
+
+    function bestSubtitleOptionForLang(lang, sourceUrl = '') {
+        const normalized = normalizeLang(lang);
+        if (!normalized) {
+            return null;
+        }
+        const options = mergedNativeOptions().filter(option => normalizeLang(option.lang || '') === normalized);
+        if (!options.length) {
+            return null;
+        }
+        if (sourceUrl) {
+            const byUrl = options.find(option => Array.isArray(option.urls) && option.urls.includes(sourceUrl));
+            if (byUrl) {
+                return byUrl;
+            }
+        }
+        const native = options.find(option => /^native-/.test(option.source || '') || /^subtitle:/.test(option.key || ''));
+        return native || options[0];
     }
 
     function officialOptionCached(option) {
@@ -394,6 +465,18 @@
         setDisplaySlot(slot, raw.replace(/^cached:/, ''));
     }
 
+    function clearPendingSubtitleSlot(slot, option = null) {
+        delete state.pendingSlotValues[slot];
+        if (option && option.lang) {
+            delete state.pendingSlots[option.key];
+            delete state.pendingSlots[option.lang];
+        }
+        if (state.pendingCaptureSlot === slot) {
+            state.pendingCaptureSlot = '';
+        }
+        state.selectorSignature = '';
+    }
+
     function setAudioSelectValue(value) {
         const raw = String(value || '');
         if (!raw) {
@@ -446,7 +529,8 @@
             label,
             cues: cues.slice().sort((a, b) => a.start - b.start),
             sourceUrl: sourceUrl || '',
-            savedAt: Date.now()
+            savedAt: Date.now(),
+            videoId: currentContextVideoId()
         };
         state.tracks.set(key, track);
 
@@ -500,6 +584,10 @@
                 }
 
                 const track = JSON.parse(raw);
+                const currentVideoId = currentContextVideoId();
+                if (track && track.videoId && currentVideoId && String(track.videoId) !== String(currentVideoId)) {
+                    continue;
+                }
                 const trackLang = normalizeLang(track && track.lang || candidateKey);
                 if (trackLang && Array.isArray(track.cues) && track.cues.length) {
                     track.lang = trackLang;
@@ -525,6 +613,7 @@
         const prefix = cachePrefix();
         state.tracks.clear();
         state.displayLangs = [];
+        clearSubtitleOverlay();
         state.manualDisplay = false;
         state.nativeOptions = [];
         state.manifestOptions = [];
@@ -887,6 +976,13 @@
         return track.cues.find(cue => timeMs >= cue.start - 80 && timeMs <= cue.end + 500) || null;
     }
 
+    function clearSubtitleOverlay() {
+        state.lastText = '';
+        if (state.textNode) {
+            state.textNode.textContent = '';
+        }
+    }
+
     function applyNativeSubtitleVisibility() {
         document.documentElement.classList.toggle('nds-hide-native-subtitles', state.hideNative);
         document.documentElement.classList.toggle('nds-addon-active', state.enabled);
@@ -977,6 +1073,7 @@
 
         const officialOptions = mergedNativeOptions();
         const officialTrackKeys = new Set();
+        const officialLangs = new Set(officialOptions.map(option => normalizeLang(option.lang || '')).filter(Boolean));
         officialOptions.forEach(nativeOption => {
             const option = document.createElement('option');
             const cachedKey = cachedTrackKeyForOption(nativeOption);
@@ -990,7 +1087,7 @@
             select.appendChild(option);
         });
 
-        tracks.filter(track => !officialTrackKeys.has(trackCacheKey(track))).forEach(track => {
+        tracks.filter(track => !officialTrackKeys.has(trackCacheKey(track)) && !officialLangs.has(normalizeLang(track.lang || ''))).forEach(track => {
             const option = document.createElement('option');
             const trackKey = trackCacheKey(track);
             option.value = 'cached:' + trackKey;
@@ -1159,13 +1256,14 @@
         state.statusNode.textContent = state.status + ' | ' + (state.manualDisplay ? 'manual' : 'latest') + ' | ' + summary + ' | video:' + videoId();
         renderSelector();
 
-        if (!state.enabled) {
-            state.textNode.textContent = '';
+        if (!state.enabled || !state.displayLangs.length) {
+            clearSubtitleOverlay();
             return;
         }
 
         const video = getVideo();
         if (!video) {
+            clearSubtitleOverlay();
             return;
         }
 
@@ -1480,7 +1578,7 @@
 
         const trackId = String(track.id || track.trackId || track.Au || track.Ix || track.new_track_id || '');
         return {
-            key: 'manifest:' + stableHash([state.videoId || videoId(), trackId, lang, label, urls[0]].join('|')),
+            key: 'manifest:' + stableHash([currentContextVideoId(), trackId, lang, label, urls[0]].join('|')),
             label: cleanLanguageDisplayLabel(label, lang) || lang || 'Unknown',
             lang,
             urls,
@@ -1505,7 +1603,7 @@
         const channels = String(track.channels || track.bqd || track.channelCount || '');
         const suffix = [lang, channels && channels !== '0' ? channels : ''].filter(Boolean).join(', ');
         return {
-            key: 'audio-manifest:' + stableHash([state.videoId || videoId(), trackId, lang, label, channels].join('|')),
+            key: 'audio-manifest:' + stableHash([currentContextVideoId(), trackId, lang, label, channels].join('|')),
             label: label + (suffix ? ' (' + suffix + ')' : ''),
             lang,
             trackId,
@@ -1662,10 +1760,10 @@
         }
 
         state.prefetchActive = true;
-        const requestVideoId = state.videoId || videoId();
+        const requestVideoId = currentContextVideoId();
         try {
             while (state.prefetchQueue.length) {
-                if (requestVideoId !== (state.videoId || videoId())) {
+                if (requestVideoId !== currentContextVideoId()) {
                     state.prefetchQueue = [];
                     return;
                 }
@@ -1680,7 +1778,7 @@
             }
         } finally {
             state.prefetchActive = false;
-            if (requestVideoId === (state.videoId || videoId())) {
+            if (requestVideoId === currentContextVideoId()) {
                 state.status = 'preloaded ' + state.tracks.size + ' subtitle track(s)';
                 state.selectorSignature = '';
                 render();
@@ -1692,7 +1790,7 @@
         for (const url of option.urls) {
             try {
                 const response = await gmGet(url);
-                if (requestVideoId !== (state.videoId || videoId())) {
+                if (requestVideoId !== currentContextVideoId()) {
                     return false;
                 }
 
@@ -1719,11 +1817,11 @@
             return false;
         }
 
-        const requestVideoId = state.videoId || videoId();
+        const requestVideoId = currentContextVideoId();
         notify('Fetching ' + trackDisplayLabel(track) + ' from saved Netflix URL');
         try {
             const response = await gmGet(track.sourceUrl);
-            if (requestVideoId !== (state.videoId || videoId())) {
+            if (requestVideoId !== currentContextVideoId()) {
                 return false;
             }
             const body = String(response.responseText || '');
@@ -1775,7 +1873,7 @@
             return true;
         }
 
-        const requestVideoId = state.videoId || videoId();
+        const requestVideoId = currentContextVideoId();
         state.manualDisplay = true;
         state.pendingSlotValues[slot] = 'official:' + option.key;
         if (option.lang) {
@@ -1789,7 +1887,7 @@
         for (const url of option.urls) {
             try {
                 const response = await gmGet(url);
-                if (requestVideoId !== (state.videoId || videoId())) {
+                if (requestVideoId !== currentContextVideoId()) {
                     return false;
                 }
                 const body = String(response.responseText || '');
@@ -1805,12 +1903,7 @@
             } catch (_) {}
         }
 
-        delete state.pendingSlotValues[slot];
-        if (option.lang) {
-            delete state.pendingSlots[option.key];
-            delete state.pendingSlots[option.lang];
-        }
-        state.pendingCaptureSlot = '';
+        clearPendingSubtitleSlot(slot, option);
         notify('Could not fetch Netflix subtitle: ' + option.label);
         return false;
     }
@@ -1821,13 +1914,13 @@
         }
 
         state.requestedUrls.add(url);
-        const requestVideoId = state.videoId || videoId();
+        const requestVideoId = currentContextVideoId();
         state.status = 'intercepted ?o=1 request #' + state.requestedUrls.size;
         render();
 
         try {
             const response = await gmGet(url);
-            if (requestVideoId !== (state.videoId || videoId())) {
+            if (requestVideoId !== currentContextVideoId()) {
                 return;
             }
             const body = String(response.responseText || '');
@@ -1837,15 +1930,21 @@
                 return;
             }
 
-            rememberPayload(url, body);
+            rememberPayload(url, body, requestVideoId);
         } catch (error) {
             state.status = 'fetch error: ' + (error && error.message ? error.message : 'unknown');
             render();
         }
     }
 
-    function rememberPayload(url, payload) {
+    function rememberPayload(url, payload, payloadVideoId = '') {
         if (typeof payload !== 'string' || payload.length > MAX_RESPONSE_CHARS) {
+            return;
+        }
+
+        const currentVideoId = currentContextVideoId();
+        const capturedVideoId = String(payloadVideoId || '');
+        if (capturedVideoId && currentVideoId && capturedVideoId !== currentVideoId) {
             return;
         }
 
@@ -1868,7 +1967,15 @@
         }
 
         const cues = parseCues(payload);
-        if (!saveTrack(lang, cues, url)) {
+        const option = bestSubtitleOptionForLang(lang, url);
+        const saveOptions = option ? {
+            silent: true,
+            preserveDisplay: true,
+            key: option.key,
+            optionKey: option.key,
+            label: option.label
+        } : { silent: true, preserveDisplay: true };
+        if (!saveTrack(lang, cues, url, saveOptions)) {
             state.status = 'intercepted ' + rawLang + ' but could not parse len=' + payload.length;
             render();
         }
@@ -1903,11 +2010,16 @@
             const originalOpen = XMLHttpRequest.prototype.open;
             const originalSend = XMLHttpRequest.prototype.send;
 
-            function emit(url, payload) {
+            function currentWatchId() {
+                const match = String(location.pathname || '').match(/\/watch\/(\d+)/);
+                return match ? match[1] : '';
+            }
+
+            function emit(url, payload, watchId) {
                 if (typeof payload !== 'string' || payload.length > maxChars) {
                     return;
                 }
-                window.dispatchEvent(new CustomEvent(eventName, { detail: { url: String(url || ''), payload } }));
+                window.dispatchEvent(new CustomEvent(eventName, { detail: { url: String(url || ''), payload, videoId: watchId || currentWatchId() } }));
             }
 
             function relevant(url, type) {
@@ -1918,11 +2030,12 @@
             if (typeof originalFetch === 'function' && !originalFetch.__ndsPatched) {
                 window.fetch = function(input) {
                     const requestUrl = input && input.url ? input.url : input;
+                    const requestWatchId = currentWatchId();
                     return originalFetch.apply(this, arguments).then(response => {
                         const responseUrl = response.url || requestUrl;
                         const type = response.headers && response.headers.get ? response.headers.get('content-type') : '';
                         if (response.clone && relevant(responseUrl, type)) {
-                            response.clone().text().then(text => emit(responseUrl, text)).catch(() => {});
+                            response.clone().text().then(text => emit(responseUrl, text, requestWatchId)).catch(() => {});
                         }
                         return response;
                     });
@@ -1933,6 +2046,7 @@
             if (!XMLHttpRequest.prototype.open.__ndsPatched) {
                 XMLHttpRequest.prototype.open = function(method, url) {
                     this.__ndsUrl = url;
+                    this.__ndsWatchId = currentWatchId();
                     return originalOpen.apply(this, arguments);
                 };
                 XMLHttpRequest.prototype.open.__ndsPatched = true;
@@ -1947,13 +2061,13 @@
                             return;
                         }
                         if (!this.responseType || this.responseType === 'text') {
-                            emit(url, this.responseText);
+                            emit(url, this.responseText, this.__ndsWatchId);
                         } else if (this.responseType === 'json') {
                             try {
-                                emit(url, JSON.stringify(this.response));
+                                emit(url, JSON.stringify(this.response), this.__ndsWatchId);
                             } catch (_) {}
                         } else if (typeof this.response === 'string') {
-                            emit(url, this.response);
+                            emit(url, this.response, this.__ndsWatchId);
                         }
                     });
                     return originalSend.apply(this, arguments);
@@ -2204,26 +2318,71 @@
         return { key: kind + ':' + nativeLabelKey(label), label, lang, element: node, source: 'native-' + kind };
     }
 
-    function collectNativeSubtitleOptions() {
-        const options = [];
-        const seen = new Set();
-        const containers = subtitleListContainers();
-        for (const container of containers) {
-            for (const node of subtitleSectionNodes(container)) {
-                const option = nativeOptionFromNode(node);
-                if (!option || seen.has(option.key)) {
-                    continue;
-                }
-                seen.add(option.key);
-                options.push({ key: option.key, label: option.label, lang: option.lang });
+    function nativeMediaRows(kind) {
+        const prefix = kind === 'audio' ? 'audio-item-' : 'subtitle-item-';
+        return Array.from(document.querySelectorAll('li[data-uia^="' + prefix + '"], [data-uia^="' + prefix + '"]'))
+            .filter(visibleElement)
+            .filter(node => !state.root || !state.root.contains(node));
+    }
+
+    async function waitForNativeMediaRows(kind, timeoutMs = 2200) {
+        const started = Date.now();
+        while (Date.now() - started < timeoutMs) {
+            wakeNetflixControls();
+            const rows = nativeMediaRows(kind);
+            if (rows.some(row => nativeOptionFromNode(row, kind))) {
+                return true;
             }
-            if (options.length) {
-                break;
-            }
+            await sleep(80);
         }
-        state.nativeOptions = options.sort((a, b) => a.label.localeCompare(b.label));
-        state.selectorSignature = '';
-        renderSelector();
+        return false;
+    }
+
+    function findNativeMediaOptionElement(kind, option) {
+        return kind === 'audio' ? findNativeAudioOptionElement(option) : findNativeSubtitleOptionElement(option);
+    }
+
+    async function waitForNativeMediaOptionElement(kind, option, timeoutMs = 3200) {
+        const started = Date.now();
+        while (Date.now() - started < timeoutMs) {
+            wakeNetflixControls();
+            const element = findNativeMediaOptionElement(kind, option);
+            if (element && visibleElement(element)) {
+                return element;
+            }
+            await sleep(80);
+        }
+        return null;
+    }
+
+    function nativeSubtitleCandidates() {
+        const candidates = [];
+        const seen = new Set();
+        const addNode = node => {
+            const option = nativeOptionFromNode(node, 'subtitle');
+            if (!option || seen.has(option.key)) {
+                return;
+            }
+            seen.add(option.key);
+            candidates.push(option);
+        };
+
+        for (const container of subtitleListContainers()) {
+            subtitleSectionNodes(container).forEach(addNode);
+        }
+        nativeMediaRows('subtitle').forEach(addNode);
+        return candidates;
+    }
+
+    function collectNativeSubtitleOptions() {
+        const options = nativeSubtitleCandidates()
+            .map(option => ({ key: option.key, label: option.label, lang: option.lang, source: 'native-subtitle' }))
+            .sort((a, b) => a.label.localeCompare(b.label));
+        if (options.length) {
+            state.nativeOptions = options;
+            state.selectorSignature = '';
+            renderSelector();
+        }
         return mergedNativeOptions();
     }
 
@@ -2256,11 +2415,12 @@
                 const button = findNetflixSubtitleButton();
                 if (button) {
                     clickNativeElement(button);
-                    await sleep(350);
-                    if (audioListContainers().length) {
+                    await waitForNativeMediaRows('audio');
+                    await waitForNativeMediaRows('subtitle');
+                    if (nativeAudioCandidates().length) {
                         collectNativeAudioOptions();
                     }
-                    if (subtitleListContainers().length) {
+                    if (nativeSubtitleCandidates().length) {
                         collectNativeSubtitleOptions();
                     }
                 }
@@ -2286,8 +2446,7 @@
             return false;
         }
         clickNativeElement(button);
-        await sleep(350);
-        return !!subtitleListContainers().length;
+        return await waitForNativeMediaRows('subtitle');
     }
 
     async function ensureNativeAudioMenuOpen() {
@@ -2300,23 +2459,52 @@
             return false;
         }
         clickNativeElement(button);
-        await sleep(350);
-        return !!audioListContainers().length;
+        return await waitForNativeMediaRows('audio');
     }
 
     function findNativeSubtitleOptionElement(option) {
-        const key = option && option.key;
-        if (!key) {
+        if (!option) {
             return null;
         }
-        for (const container of subtitleListContainers()) {
-            const found = subtitleSectionNodes(container)
-                .map(node => nativeOptionFromNode(node))
-                .find(item => item && item.key === key);
-            if (found) {
-                return found.element;
+        const candidates = nativeSubtitleCandidates();
+        const optionIdentity = optionLabelIdentity(option.label);
+        const exact = candidates.find(item => item.key === option.key || optionLabelIdentity(item.label) === optionIdentity);
+        if (exact) {
+            return exact.element;
+        }
+
+        const targetLang = option.lang || langFromNativeLabel(option.label);
+        const sameLang = targetLang ? candidates.filter(item => item.lang === targetLang) : [];
+        if (sameLang.length === 1) {
+            return sameLang[0].element;
+        }
+
+        const wantsCc = isCcSubtitleLabel(option.label);
+        const ccMatches = sameLang.filter(item => isCcSubtitleLabel(item.label));
+        const nonCc = sameLang.filter(item => !isCcSubtitleLabel(item.label));
+        if (wantsCc) {
+            const bestCc = singleBestSubtitleVariant(ccMatches);
+            if (bestCc) {
+                return bestCc.element;
             }
         }
+        if (!wantsCc) {
+            const bestNonCc = singleBestSubtitleVariant(nonCc);
+            if (bestNonCc) {
+                return bestNonCc.element;
+            }
+        }
+
+        const optionBaseIdentity = subtitleBaseLabelIdentity(option.label);
+        const sameBase = sameLang.filter(item => subtitleBaseLabelIdentity(item.label) === optionBaseIdentity);
+        if (sameBase.length === 1) {
+            return sameBase[0].element;
+        }
+        const sameBaseByCc = sameBase.filter(item => isCcSubtitleLabel(item.label) === wantsCc);
+        if (sameBaseByCc.length === 1) {
+            return sameBaseByCc[0].element;
+        }
+
         return null;
     }
 
@@ -2335,9 +2523,7 @@
         for (const container of audioListContainers()) {
             audioSectionNodes(container).forEach(addNode);
         }
-        Array.from(document.querySelectorAll('li[data-uia^="audio-item-"], [data-uia^="audio-item-"]'))
-            .filter(node => !state.root || !state.root.contains(node))
-            .forEach(addNode);
+        nativeMediaRows('audio').forEach(addNode);
         return candidates;
     }
 
@@ -2383,13 +2569,21 @@
             return false;
         }
 
-        await ensureNativeAudioMenuOpen();
+        if (!await ensureNativeAudioMenuOpen()) {
+            notify('Netflix audio menu did not open');
+            return false;
+        }
+        await waitForNativeMediaRows('audio');
         collectNativeAudioOptions();
-        const element = findNativeAudioOptionElement(option);
+        const element = await waitForNativeMediaOptionElement('audio', option);
         if (!element) {
             notify('Audio option not available in Netflix menu: ' + option.label);
             return false;
         }
+        try {
+            element.scrollIntoView({ block: 'center', inline: 'nearest' });
+        } catch (_) {}
+        await sleep(60);
         await clickNativeMediaElement(element);
         state.selectedAudioKey = option.key;
         state.selectorSignature = '';
@@ -2423,13 +2617,25 @@
         state.selectorSignature = '';
         renderSelector();
 
-        await ensureNativeSubtitleMenuOpen();
+        if (!await ensureNativeSubtitleMenuOpen()) {
+            clearPendingSubtitleSlot(slot, option);
+            renderSelector();
+            notify('Netflix subtitle menu did not open');
+            return false;
+        }
+        await waitForNativeMediaRows('subtitle');
         collectNativeSubtitleOptions();
-        const element = findNativeSubtitleOptionElement(option);
+        const element = await waitForNativeMediaOptionElement('subtitle', option);
         if (!element) {
+            clearPendingSubtitleSlot(slot, option);
+            renderSelector();
             notify('Subtitle option not available in Netflix menu: ' + option.label);
             return false;
         }
+        try {
+            element.scrollIntoView({ block: 'center', inline: 'nearest' });
+        } catch (_) {}
+        await sleep(60);
         await clickNativeMediaElement(element);
         notify('Selected Netflix subtitle: ' + option.label);
         return true;
@@ -2445,6 +2651,7 @@
         state.requestedUrls.clear();
         state.tracks.clear();
         state.displayLangs = [];
+        clearSubtitleOverlay();
         state.manualDisplay = false;
         state.nativeOptions = [];
         state.manifestOptions = [];
@@ -2534,7 +2741,7 @@
     }
 
     function init() {
-        window.addEventListener(BRIDGE_EVENT, event => rememberPayload(event.detail.url, event.detail.payload));
+        window.addEventListener(BRIDGE_EVENT, event => rememberPayload(event.detail.url, event.detail.payload, event.detail.videoId));
         registerMenu();
         checkWatchIdChange(true);
         watchVideoChanges();
