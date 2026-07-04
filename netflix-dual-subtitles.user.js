@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.11.9
+// @version      0.13.6
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -51,6 +51,9 @@
         hideNative: loadHideNativePreference(),
         requestedUrls: new Set(),
         resourceObserverStarted: false,
+        controlObserverStarted: false,
+        controlHoldRefreshScheduled: false,
+        controlForcedStyles: new Map(),
         historyPatched: false,
         videoId: '',
         displayLangs: [],
@@ -58,7 +61,7 @@
         selectorOpen: false,
         selectorVisible: true,
         selectorHover: false,
-        selectorSelectActive: false,
+        selectorPickerRole: '',
         selectorHideTimer: null,
         selectorSignature: '',
         nativeOptions: [],
@@ -79,8 +82,12 @@
         textNode: null,
         statusNode: null,
         selectorNode: null,
+        selectorMount: '',
+        selectorPanelScrollTop: 0,
+        selectorPanelScrollLeft: 0,
         toastNode: null,
         toastTimer: null,
+        controlWakeNudge: 0,
         lastText: '',
         status: 'manual mode: select audio/subtitle languages',
         ignoredPayloads: 0
@@ -780,14 +787,32 @@
             }
             html.nds-selector-attention [class*="watch-video--bottom-controls-container"],
             html.nds-selector-attention div:has(> [data-uia="controls-standard"]),
-            html.nds-selector-attention div:has([data-uia="controls-standard"]),
-            html.nds-selector-attention [data-uia="controls-standard"],
-            html.nds-selector-attention [data-uia="timeline"],
-            html.nds-selector-attention [data-uia^="control-"] {
+            html.nds-selector-attention div:has([data-uia="controls-standard"]) {
+                display: flex !important;
                 opacity: 1 !important;
                 visibility: visible !important;
                 transform: none !important;
+                translate: none !important;
+                filter: none !important;
                 pointer-events: auto !important;
+            }
+            html.nds-selector-attention [data-uia="controls-standard"],
+            html.nds-selector-attention [data-uia="controls-standard"] *,
+            html.nds-selector-attention [data-uia="timeline"],
+            html.nds-selector-attention [data-uia="timeline"] *,
+            html.nds-selector-attention [data-uia^="control-"],
+            html.nds-selector-attention [data-uia^="control-"] * {
+                opacity: 1 !important;
+                visibility: visible !important;
+                transform: none !important;
+                translate: none !important;
+                filter: none !important;
+                pointer-events: auto !important;
+            }
+            html.nds-selector-attention [hidden]:has([data-uia="controls-standard"]),
+            html.nds-selector-attention [aria-hidden="true"]:has([data-uia="controls-standard"]) {
+                display: flex !important;
+                visibility: visible !important;
             }
             .nds-lines {
                 max-width: min(96vw, 1680px);
@@ -900,6 +925,11 @@
                 font-size: 14px;
                 font-weight: 700;
             }
+            .nds-selector-section {
+                display: grid;
+                gap: 6px;
+                min-width: 0;
+            }
             .nds-selector-row {
                 display: grid;
                 grid-template-columns: 82px minmax(160px, 1fr);
@@ -907,13 +937,14 @@
                 gap: 10px;
                 min-height: 40px;
             }
-            .nds-selector-row label {
+            .nds-selector-row-label {
                 color: #b3b3b3;
                 font-size: 13px;
                 font-weight: 600;
             }
-            .nds-selector select {
+            .nds-choice-button {
                 min-width: 0;
+                width: 100%;
                 height: 36px;
                 border: 0;
                 border-radius: 3px;
@@ -921,21 +952,69 @@
                 color: #fff;
                 padding: 0 10px;
                 font: 14px/1.2 Arial, sans-serif;
-                outline: none;
+                text-align: left;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                cursor: pointer;
             }
-            .nds-selector select:hover,
-            .nds-selector select:focus {
+            .nds-choice-button:hover,
+            .nds-choice-button.is-active {
                 background: #444;
             }
-            .nds-selector option {
-                background: #1a1a1a;
+            .nds-picker-block {
+                display: grid;
+                gap: 7px;
+                padding-top: 8px;
+                border-top: 1px solid rgba(255,255,255,.14);
+            }
+            .nds-picker-heading {
+                color: #b3b3b3;
+                font-size: 12px;
+                font-weight: 700;
+                text-transform: uppercase;
+            }
+            .nds-radio-list {
+                display: grid;
+                gap: 2px;
+                max-height: none;
+                overflow: visible;
+                padding: 1px 0;
+            }
+            .nds-radio-option {
+                display: grid;
+                grid-template-columns: 18px minmax(0, 1fr);
+                align-items: center;
+                gap: 8px;
+                min-height: 30px;
+                padding: 4px 7px;
+                border-radius: 3px;
                 color: #fff;
+                cursor: pointer;
+            }
+            .nds-radio-option:hover,
+            .nds-radio-option:focus-within {
+                background: rgba(255,255,255,.12);
+            }
+            .nds-radio-option input {
+                width: 14px;
+                height: 14px;
+                margin: 0;
+                accent-color: #e50914;
+            }
+            .nds-radio-label {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                font-size: 13px;
+                line-height: 1.25;
             }
             .nds-selector-count {
                 color: #aaa;
                 font-size: 11px;
             }
-            .nds-selector button {
+            .nds-selector button:not(.nds-choice-button) {
                 border: 1px solid rgba(255,255,255,.22);
                 border-radius: 5px;
                 background: rgba(255,255,255,.08);
@@ -943,11 +1022,11 @@
                 padding: 6px 8px;
                 cursor: pointer;
             }
-            .nds-selector button.is-active {
+            .nds-selector button:not(.nds-choice-button).is-active {
                 background: rgba(229, 9, 20, .82);
                 border-color: rgba(255,255,255,.38);
             }
-            .nds-selector button:disabled {
+            .nds-selector button:not(.nds-choice-button):disabled {
                 cursor: default;
                 opacity: .38;
             }
@@ -997,6 +1076,11 @@
 
         const selectorNode = document.createElement('div');
         selectorNode.className = 'nds-selector';
+        ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu'].forEach(eventName => {
+            selectorNode.addEventListener(eventName, event => {
+                event.stopPropagation();
+            });
+        });
         selectorNode.addEventListener('mouseenter', () => {
             state.selectorHover = true;
             showSelectorChrome();
@@ -1005,46 +1089,37 @@
             state.selectorHover = false;
             scheduleSelectorHide();
         });
-        selectorNode.addEventListener('focusin', event => {
+        selectorNode.addEventListener('focusin', () => {
             state.selectorHover = true;
-            if (event.target && event.target.tagName === 'SELECT') {
-                state.selectorSelectActive = true;
-            }
             showSelectorChrome();
         });
         selectorNode.addEventListener('focusout', () => {
             setTimeout(() => {
-                const active = document.activeElement;
-                if (selectorNode.contains(active)) {
-                    state.selectorSelectActive = !!(active && active.tagName === 'SELECT');
+                if (selectorNode.contains(document.activeElement)) {
                     return;
                 }
-                state.selectorSelectActive = false;
                 state.selectorHover = false;
                 scheduleSelectorHide();
                 renderSelector();
             }, 0);
         });
-        selectorNode.addEventListener('pointerdown', event => {
-            if (event.target && event.target.closest && event.target.closest('select')) {
-                state.selectorSelectActive = true;
-                showSelectorChrome();
-            }
-        });
         selectorNode.addEventListener('change', event => {
-            const role = event.target && event.target.dataset ? event.target.dataset.role : '';
-            if (role === 'primary' || role === 'secondary') {
+            const target = event.target;
+            const role = target && target.dataset ? target.dataset.role : '';
+            if (target && target.type === 'radio' && (role === 'primary' || role === 'secondary')) {
                 event.preventDefault();
                 event.stopPropagation();
-                state.selectorSelectActive = false;
                 showSelectorChrome();
-                setDisplaySlotValue(role, event.target.value);
-            } else if (role === 'audio') {
+                state.selectorPickerRole = '';
+                state.selectorSignature = '';
+                setDisplaySlotValue(role, target.value);
+            } else if (target && target.type === 'radio' && role === 'audio') {
                 event.preventDefault();
                 event.stopPropagation();
-                state.selectorSelectActive = false;
                 showSelectorChrome();
-                setAudioSelectValue(event.target.value);
+                state.selectorPickerRole = '';
+                state.selectorSignature = '';
+                setAudioSelectValue(target.value);
             }
         });
         selectorNode.addEventListener('click', event => {
@@ -1063,9 +1138,17 @@
                     refreshNativeOptions(true);
                 }
                 if (!state.selectorOpen) {
+                    state.selectorPickerRole = '';
                     scheduleSelectorHide();
                 }
                 render();
+                return;
+            }
+            if (action === 'open-picker') {
+                const role = actionNode.dataset ? actionNode.dataset.role : '';
+                state.selectorPickerRole = state.selectorPickerRole === role ? '' : role;
+                state.selectorSignature = '';
+                renderSelector();
                 return;
             }
         });
@@ -1111,7 +1194,7 @@
     function applyNativeSubtitleVisibility() {
         document.documentElement.classList.toggle('nds-hide-native-subtitles', state.hideNative);
         document.documentElement.classList.toggle('nds-addon-active', state.enabled);
-        document.documentElement.classList.toggle('nds-selector-attention', state.enabled && selectorHasAttention());
+        document.documentElement.classList.toggle('nds-selector-attention', selectorShouldHoldNetflixControls());
     }
 
     function appendSelectorIconButton(parent, action, active) {
@@ -1146,104 +1229,371 @@
         parent.appendChild(button);
     }
 
-    function appendAudioSelect(parent) {
-        const options = mergedAudioOptions();
+    function appendRadioOption(list, groupName, role, value, labelText, selected) {
+        const label = document.createElement('label');
+        label.className = 'nds-radio-option';
+
+        const input = document.createElement('input');
+        input.type = 'radio';
+        input.name = groupName;
+        input.value = value;
+        input.dataset.role = role;
+        input.checked = !!selected;
+        label.appendChild(input);
+
+        const text = document.createElement('span');
+        text.className = 'nds-radio-label';
+        text.textContent = labelText;
+        text.title = labelText;
+        label.appendChild(text);
+
+        list.appendChild(label);
+    }
+
+    function appendChoiceRow(parent, title, role, currentLabel, options) {
         if (!options.length) {
             return;
         }
 
+        const section = document.createElement('div');
+        section.className = 'nds-selector-section';
+
         const row = document.createElement('div');
         row.className = 'nds-selector-row';
 
-        const label = document.createElement('label');
-        label.textContent = 'Audio';
+        const label = document.createElement('div');
+        label.className = 'nds-selector-row-label';
+        label.textContent = title;
         row.appendChild(label);
 
-        const select = document.createElement('select');
-        select.dataset.role = 'audio';
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'nds-choice-button' + (state.selectorPickerRole === role ? ' is-active' : '');
+        button.dataset.action = 'open-picker';
+        button.dataset.role = role;
+        button.textContent = currentLabel || 'Off';
+        button.title = currentLabel || 'Off';
+        row.appendChild(button);
+        section.appendChild(row);
 
-        const empty = document.createElement('option');
-        empty.value = '';
-        empty.textContent = 'Netflix current';
-        empty.selected = !state.selectedAudioKey;
-        select.appendChild(empty);
-
-        options.forEach(audioOption => {
-            const option = document.createElement('option');
-            option.value = 'audio:' + audioOption.key;
-            option.textContent = audioOption.label;
-            option.selected = audioOption.key === state.selectedAudioKey;
-            select.appendChild(option);
-        });
-        row.appendChild(select);
-        parent.appendChild(row);
+        parent.appendChild(section);
     }
 
-    function appendLanguageSelect(parent, role, tracks) {
-        const row = document.createElement('div');
-        row.className = 'nds-selector-row';
+    function appendPickerBlock(parent, title, role, options) {
+        if (!options.length) {
+            return;
+        }
 
-        const label = document.createElement('label');
-        label.textContent = role === 'primary' ? 'Primary' : 'Secondary';
-        row.appendChild(label);
+        const block = document.createElement('div');
+        block.className = 'nds-picker-block';
 
-        const select = document.createElement('select');
-        select.dataset.role = role;
+        const heading = document.createElement('div');
+        heading.className = 'nds-picker-heading';
+        heading.textContent = title;
+        block.appendChild(heading);
+
+        const list = document.createElement('div');
+        list.className = 'nds-radio-list';
+        options.forEach(option => appendRadioOption(list, 'nds-' + role, role, option.value, option.label, option.selected));
+        block.appendChild(list);
+        parent.appendChild(block);
+    }
+
+    function audioRadioOptions() {
+        const options = mergedAudioOptions();
+        return [
+            { value: '', label: 'Netflix current', selected: !state.selectedAudioKey },
+            ...options.map(audioOption => ({
+                value: 'audio:' + audioOption.key,
+                label: audioOption.label,
+                selected: audioOption.key === state.selectedAudioKey
+            }))
+        ];
+    }
+
+    function currentAudioLabel() {
+        if (!state.selectedAudioKey) {
+            return 'Netflix current';
+        }
+        const option = mergedAudioOptions().find(audioOption => audioOption.key === state.selectedAudioKey);
+        return option ? option.label : 'Netflix current';
+    }
+
+    function languageRadioOptions(role, tracks) {
         const selected = role === 'primary' ? state.displayLangs[0] : state.displayLangs[1];
         const pendingValue = state.pendingSlotValues[role] || '';
-
-        const empty = document.createElement('option');
-        empty.value = '';
-        empty.textContent = 'Off';
-        select.appendChild(empty);
+        const options = [{ value: '', label: 'Off', selected: !pendingValue && !selected }];
+        const languageOptions = [];
+        const cachedLangs = new Set(tracks.map(track => normalizeLang(track.lang || '')).filter(Boolean));
 
         const officialOptions = mergedNativeOptions();
         const officialTrackKeys = new Set();
         const officialLangs = new Set(officialOptions.map(option => normalizeLang(option.lang || '')).filter(Boolean));
         officialOptions.forEach(nativeOption => {
-            const option = document.createElement('option');
             const cachedKey = cachedTrackKeyForOption(nativeOption);
             const value = 'official:' + nativeOption.key;
+            const label = cleanLanguageDisplayLabel(nativeOption.label, nativeOption.lang) || nativeOption.label || nativeOption.lang || '';
+            const optionLang = normalizeLang(nativeOption.lang || '');
             if (cachedKey) {
                 officialTrackKeys.add(cachedKey);
             }
-            option.value = value;
-            option.textContent = cleanLanguageDisplayLabel(nativeOption.label, nativeOption.lang) || nativeOption.label || nativeOption.lang || '';
-            option.selected = pendingValue === value || !pendingValue && cachedKey && cachedKey === selected;
-            select.appendChild(option);
+            languageOptions.push({
+                value,
+                label,
+                cached: !!(cachedKey || optionLang && cachedLangs.has(optionLang)),
+                selected: pendingValue === value || !pendingValue && cachedKey && cachedKey === selected
+            });
         });
 
         tracks.filter(track => {
             const trackLang = normalizeLang(track.lang || '');
             return !officialTrackKeys.has(trackCacheKey(track)) && (!trackLang || !officialLangs.has(trackLang));
         }).forEach(track => {
-            const option = document.createElement('option');
             const trackKey = trackCacheKey(track);
-            option.value = 'cached:' + trackKey;
-            option.textContent = trackDisplayLabel(track);
-            option.selected = !pendingValue && trackKey === selected;
-            select.appendChild(option);
+            languageOptions.push({
+                value: 'cached:' + trackKey,
+                label: trackDisplayLabel(track),
+                cached: true,
+                selected: !pendingValue && trackKey === selected
+            });
         });
-        row.appendChild(select);
 
-        parent.appendChild(row);
+        languageOptions
+            .sort((a, b) => Number(b.cached) - Number(a.cached) || a.label.localeCompare(b.label))
+            .forEach(option => options.push({
+                value: option.value,
+                label: option.label,
+                selected: option.selected
+            }));
+        return options;
     }
 
-    function selectorHasOpenSelect() {
-        return !!(state.selectorSelectActive || (state.selectorNode && state.selectorNode.contains(document.activeElement) && document.activeElement && document.activeElement.tagName === 'SELECT'));
+    function currentLanguageLabel(role, options) {
+        const selected = options.find(option => option.selected);
+        return selected ? selected.label : 'Off';
+    }
+
+    function appendAudioChoice(parent) {
+        const options = audioRadioOptions();
+        if (options.length <= 1) {
+            return [];
+        }
+        appendChoiceRow(parent, 'Audio', 'audio', currentAudioLabel(), options);
+        return options;
+    }
+
+    function appendLanguageChoice(parent, role, tracks) {
+        const options = languageRadioOptions(role, tracks);
+        appendChoiceRow(parent, role === 'primary' ? 'Primary' : 'Secondary', role, currentLanguageLabel(role, options), options);
+        return options;
     }
 
     function selectorHasAttention() {
-        return !!(state.selectorOpen || state.selectorHover || selectorHasOpenSelect() || (state.selectorNode && (state.selectorNode.matches(':hover') || state.selectorNode.contains(document.activeElement))));
+        return !!(state.selectorOpen || state.selectorHover || (state.selectorNode && (state.selectorNode.matches(':hover') || state.selectorNode.contains(document.activeElement))));
+    }
+
+    function selectorPanelIsPresent() {
+        return !!(state.selectorOpen && state.selectorNode && state.selectorNode.querySelector('.nds-selector-panel'));
+    }
+
+    function selectorIsAppearing() {
+        return !!(state.selectorNode && (state.selectorVisible || state.selectorOpen));
+    }
+
+    function selectorShouldHoldNetflixControls() {
+        return !!(state.enabled && (selectorIsAppearing() || selectorPanelIsPresent() || selectorHasAttention()));
+    }
+
+    function netflixControlCandidateSelectors() {
+        return [
+            '[data-uia="player"]',
+            '[data-uia="controls-standard"]',
+            '[data-uia="timeline"]',
+            '[data-uia^="control-"]',
+            '[class*="watch-video--bottom-controls-container"]'
+        ];
+    }
+
+    function isNetflixControlElement(element) {
+        if (!element || element.nodeType !== 1) {
+            return false;
+        }
+        return netflixControlCandidateSelectors().some(selector => {
+            try {
+                return element.matches(selector) || !!element.closest(selector);
+            } catch (_) {
+                return false;
+            }
+        });
+    }
+
+    function addedNodeTouchesNetflixControls(node) {
+        if (isNetflixControlElement(node)) {
+            return true;
+        }
+        if (!node || node.nodeType !== 1 || typeof node.querySelector !== 'function') {
+            return false;
+        }
+        return netflixControlCandidateSelectors().some(selector => {
+            try {
+                return !!node.querySelector(selector);
+            } catch (_) {
+                return false;
+            }
+        });
+    }
+
+    function mutationTouchesNetflixControls(mutation) {
+        if (isNetflixControlElement(mutation.target)) {
+            return true;
+        }
+        return Array.from(mutation.addedNodes || []).some(addedNodeTouchesNetflixControls);
+    }
+
+    function forceStyle(element, property, value) {
+        if (!element || !element.style) {
+            return;
+        }
+        let previous = state.controlForcedStyles.get(element);
+        if (!previous) {
+            previous = {};
+            state.controlForcedStyles.set(element, previous);
+        }
+        if (!previous[property]) {
+            previous[property] = {
+                value: element.style.getPropertyValue(property),
+                priority: element.style.getPropertyPriority(property)
+            };
+        }
+        element.style.setProperty(property, value, 'important');
+    }
+
+    function restoreNetflixControlForceStyles() {
+        state.controlForcedStyles.forEach((properties, element) => {
+            Object.keys(properties).forEach(property => {
+                const previous = properties[property];
+                try {
+                    element.style.setProperty(property, previous.value, previous.priority);
+                } catch (_) {}
+            });
+        });
+        state.controlForcedStyles.clear();
+    }
+
+    function addNetflixControlForceTarget(targets, element) {
+        if (element && element.nodeType === 1) {
+            targets.add(element);
+        }
+    }
+
+    function netflixControlForceTargets() {
+        const targets = new Set();
+        document.querySelectorAll('[class*="watch-video--bottom-controls-container"], [data-uia="controls-standard"], [data-uia="timeline"], [data-uia^="control-"]').forEach(element => {
+            addNetflixControlForceTarget(targets, element);
+            let parent = element.parentElement;
+            for (let depth = 0; parent && depth < 5; depth += 1) {
+                addNetflixControlForceTarget(targets, parent);
+                if (parent.matches && parent.matches('[data-uia="player"]')) {
+                    break;
+                }
+                parent = parent.parentElement;
+            }
+        });
+        return Array.from(targets);
+    }
+
+    function shouldForceControlDisplay(element) {
+        if (!element || !element.matches) {
+            return false;
+        }
+        if (element.matches('[class*="watch-video--bottom-controls-container"]')) {
+            return true;
+        }
+        try {
+            return element.matches('div') && (
+                !!element.querySelector(':scope > [data-uia="controls-standard"]') ||
+                !!element.querySelector(':scope > div > [data-uia="controls-standard"]')
+            );
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function applyNetflixControlForceStyles() {
+        const targets = netflixControlForceTargets();
+        targets.forEach(element => {
+            forceStyle(element, 'opacity', '1');
+            forceStyle(element, 'visibility', 'visible');
+            forceStyle(element, 'pointer-events', 'auto');
+            forceStyle(element, 'transform', 'none');
+            forceStyle(element, 'translate', 'none');
+            forceStyle(element, 'filter', 'none');
+            if (shouldForceControlDisplay(element)) {
+                forceStyle(element, 'display', 'flex');
+            }
+        });
+    }
+
+    function applyNetflixControlHold() {
+        document.documentElement.classList.add('nds-selector-attention');
+        applyNetflixControlForceStyles();
+        wakeNetflixControls();
+    }
+
+    function releaseNetflixControlHold() {
+        document.documentElement.classList.remove('nds-selector-attention');
+        restoreNetflixControlForceStyles();
+    }
+
+    function scheduleNetflixControlHoldRefresh() {
+        if (!selectorShouldHoldNetflixControls() || state.controlHoldRefreshScheduled) {
+            return;
+        }
+        state.controlHoldRefreshScheduled = true;
+        const schedule = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : callback => setTimeout(callback, 16);
+        schedule(() => {
+            state.controlHoldRefreshScheduled = false;
+            if (!selectorShouldHoldNetflixControls()) {
+                releaseNetflixControlHold();
+                return;
+            }
+            applyNetflixControlHold();
+        });
+    }
+
+    function observeNetflixControlVisibility() {
+        if (state.controlObserverStarted || typeof MutationObserver !== 'function') {
+            return;
+        }
+        const target = document.body || document.documentElement;
+        if (!target) {
+            return;
+        }
+        try {
+            new MutationObserver(mutations => {
+                if (!selectorShouldHoldNetflixControls()) {
+                    return;
+                }
+                if (mutations.some(mutationTouchesNetflixControls)) {
+                    scheduleNetflixControlHoldRefresh();
+                }
+            }).observe(target, {
+                subtree: true,
+                childList: true,
+                attributes: true,
+                attributeFilter: ['class', 'style', 'aria-hidden']
+            });
+            state.controlObserverStarted = true;
+        } catch (_) {}
     }
 
     function keepNetflixControlsVisible() {
-        const hasAttention = state.enabled && selectorHasAttention();
-        document.documentElement.classList.toggle('nds-selector-attention', hasAttention);
-        if (!hasAttention) {
+        const shouldHoldControls = selectorShouldHoldNetflixControls();
+        if (!shouldHoldControls) {
+            releaseNetflixControlHold();
             return;
         }
-        wakeNetflixControls();
+        applyNetflixControlHold();
     }
 
     function cacheVisibleNativeOptions() {
@@ -1295,10 +1645,17 @@
     }
 
     function noteScreenActivity() {
+        const wasVisible = state.selectorVisible;
         state.selectorVisible = true;
-        state.selectorSignature = '';
-        scheduleSelectorHide();
-        renderSelector();
+        if (selectorHasAttention()) {
+            keepNetflixControlsVisible();
+        } else {
+            scheduleSelectorHide();
+        }
+        if (!wasVisible) {
+            state.selectorSignature = '';
+            renderSelector();
+        }
     }
 
     function closeSelectorPanel() {
@@ -1306,7 +1663,7 @@
             return false;
         }
         state.selectorOpen = false;
-        state.selectorSelectActive = false;
+        state.selectorPickerRole = '';
         state.selectorSignature = '';
         renderSelector();
         scheduleSelectorHide();
@@ -1315,9 +1672,6 @@
 
     function handleSelectorOutsidePointer(event) {
         if (!state.selectorOpen || !state.selectorNode) {
-            return;
-        }
-        if (selectorHasOpenSelect()) {
             return;
         }
         const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
@@ -1334,27 +1688,76 @@
         }
     }
 
+    function netflixBottomControlsContainer() {
+        const controls = document.querySelector('[data-uia="controls-standard"]');
+        if (controls) {
+            const bottom = controls.closest('[class*="watch-video--bottom-controls-container"]');
+            if (bottom) {
+                return bottom;
+            }
+            return controls.parentElement || controls;
+        }
+        return document.querySelector('[class*="watch-video--bottom-controls-container"]');
+    }
+
+    function selectorShouldMountInNetflixControls() {
+        return !!(state.enabled && (selectorIsAppearing() || selectorHasAttention()));
+    }
+
     function mountSelectorNode() {
         const selector = state.selectorNode;
         if (!selector) {
             return 'none';
         }
 
+        const netflixControls = selectorShouldMountInNetflixControls() ? netflixBottomControlsContainer() : null;
+        if (netflixControls) {
+            if (selector.parentNode !== netflixControls) {
+                netflixControls.appendChild(selector);
+            }
+            selector.dataset.mount = 'netflix-controls';
+            state.selectorMount = 'netflix-controls';
+            return 'netflix-controls';
+        }
+
         if (state.root && selector.parentNode !== state.root) {
             state.root.insertBefore(selector, state.toastNode || null);
         }
+        selector.dataset.mount = 'overlay';
+        state.selectorMount = 'overlay';
         return 'overlay';
+    }
+
+    function rememberSelectorPanelScroll() {
+        const panel = state.selectorNode && state.selectorNode.querySelector('.nds-selector-panel');
+        if (!panel) {
+            return;
+        }
+        state.selectorPanelScrollTop = panel.scrollTop || 0;
+        state.selectorPanelScrollLeft = panel.scrollLeft || 0;
+    }
+
+    function restoreSelectorPanelScroll() {
+        const panel = state.selectorNode && state.selectorNode.querySelector('.nds-selector-panel');
+        if (!panel) {
+            return;
+        }
+        panel.scrollTop = state.selectorPanelScrollTop || 0;
+        panel.scrollLeft = state.selectorPanelScrollLeft || 0;
     }
 
     function renderSelector() {
         if (!state.selectorNode) {
             return;
         }
+        rememberSelectorPanelScroll();
         mountSelectorNode();
 
         const tracks = Array.from(state.tracks.values()).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
         const signature = [
             state.selectorOpen ? 'open' : 'closed',
+            state.selectorMount,
+            state.selectorPickerRole,
             state.selectorVisible ? 'visible' : 'idle',
             state.manualDisplay ? 'manual' : 'latest',
             state.displayLangs.join(','),
@@ -1367,9 +1770,6 @@
             tracks.map(track => trackCacheKey(track) + ':' + track.lang + ':' + trackDisplayLabel(track) + ':' + track.cues.length + ':' + (track.savedAt || 0)).join('|')
         ].join('::');
         if (signature === state.selectorSignature) {
-            return;
-        }
-        if (selectorHasOpenSelect()) {
             return;
         }
         state.selectorSignature = signature;
@@ -1402,15 +1802,21 @@
                     'Waiting for Netflix audio/subtitle languages...';
             panel.appendChild(empty);
         }
+        const pickerOptions = {};
         if (audioOptions.length) {
-            appendAudioSelect(panel);
+            pickerOptions.audio = appendAudioChoice(panel);
         }
         if (tracks.length || officialOptions.length) {
-            appendLanguageSelect(panel, 'primary', tracks);
-            appendLanguageSelect(panel, 'secondary', tracks);
+            pickerOptions.primary = appendLanguageChoice(panel, 'primary', tracks);
+            pickerOptions.secondary = appendLanguageChoice(panel, 'secondary', tracks);
+        }
+        if (state.selectorPickerRole && pickerOptions[state.selectorPickerRole]) {
+            const pickerTitle = state.selectorPickerRole === 'audio' ? 'Audio' : state.selectorPickerRole === 'primary' ? 'Primary' : 'Secondary';
+            appendPickerBlock(panel, pickerTitle, state.selectorPickerRole, pickerOptions[state.selectorPickerRole]);
         }
 
         selector.appendChild(panel);
+        restoreSelectorPanelScroll();
     }
 
     function render() {
@@ -2304,27 +2710,72 @@
         }
     }
 
+    function makeNetflixActivityEvent(type, init, pointer = false) {
+        let event;
+        try {
+            event = pointer && typeof PointerEvent === 'function' ? new PointerEvent(type, init) : new MouseEvent(type, init);
+        } catch (_) {
+            event = new MouseEvent(type, init);
+        }
+        ['pageX', 'pageY'].forEach(prop => {
+            try {
+                Object.defineProperty(event, prop, { configurable: true, get: () => init[prop] });
+            } catch (_) {}
+        });
+        return event;
+    }
+
+    function dispatchNetflixActivity(target, clientX, clientY) {
+        const pageX = clientX + window.scrollX;
+        const pageY = clientY + window.scrollY;
+        const eventInit = {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            view: window,
+            detail: 0,
+            clientX,
+            clientY,
+            pageX,
+            pageY,
+            screenX: clientX,
+            screenY: clientY,
+            buttons: 0,
+            button: 0,
+            pointerId: 1,
+            pointerType: 'mouse',
+            isPrimary: true
+        };
+        const targets = [target, document, window];
+        ['pointerover', 'pointerenter', 'pointermove'].forEach(type => {
+            targets.forEach(node => {
+                try {
+                    node.dispatchEvent(makeNetflixActivityEvent(type, eventInit, true));
+                } catch (_) {}
+            });
+        });
+        ['mouseover', 'mouseenter', 'mousemove'].forEach(type => {
+            targets.forEach(node => {
+                try {
+                    node.dispatchEvent(makeNetflixActivityEvent(type, eventInit, false));
+                } catch (_) {}
+            });
+        });
+    }
+
     function wakeNetflixControls() {
-        const target = getVideo() || document.querySelector('[data-uia="player"]') || document.body;
+        const player = document.querySelector('[data-uia="player"]');
+        const target = player || getVideo() || document.body;
         if (!target) {
             return;
         }
         const rect = target.getBoundingClientRect ? target.getBoundingClientRect() : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
-        const eventInit = {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-            clientX: Math.max(1, Math.round(rect.left + Math.min(rect.width || window.innerWidth, 80))),
-            clientY: Math.max(1, Math.round(rect.top + Math.min(rect.height || window.innerHeight, 80)))
-        };
-        [target, document, window].forEach(node => {
-            try {
-                node.dispatchEvent(new MouseEvent('mousemove', eventInit));
-            } catch (_) {}
-            try {
-                node.dispatchEvent(new PointerEvent('pointermove', eventInit));
-            } catch (_) {}
-        });
+        const baseX = Math.max(1, Math.round(rect.left + Math.min(rect.width || window.innerWidth, 96)));
+        const baseY = Math.max(1, Math.round(rect.top + Math.min(rect.height || window.innerHeight, 96)));
+        state.controlWakeNudge = (state.controlWakeNudge + 1) % 11;
+        const nudge = state.controlWakeNudge + 1;
+        dispatchNetflixActivity(target, baseX + nudge, baseY + nudge);
+        setTimeout(() => dispatchNetflixActivity(target, baseX + ((nudge + 3) % 5), baseY + ((nudge + 5) % 5)), 8);
     }
 
     function findNetflixSubtitleButton() {
@@ -2927,6 +3378,7 @@
         addStyles();
         injectNetworkBridge();
         observeSubtitleRequests();
+        observeNetflixControlVisibility();
         cacheVisibleNativeOptions();
         if (document.body) {
             createOverlay();
@@ -2960,7 +3412,7 @@
             document.addEventListener(eventName, ensureRuntimeReady);
         });
         setInterval(ensureRuntimeReady, 1500);
-        setInterval(keepNetflixControlsVisible, 300);
+        setInterval(keepNetflixControlsVisible, 150);
         setInterval(render, RENDER_INTERVAL_MS);
     }
 
