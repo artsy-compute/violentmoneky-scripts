@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.11.3
+// @version      0.11.5
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -262,12 +262,38 @@
         return text;
     }
 
+    function isBareLangDisplayLabel(label, lang = '') {
+        const text = normalizeNativeLabel(label).toLowerCase();
+        const normalizedLang = normalizeLang(lang).toLowerCase();
+        if (!text || !normalizedLang) {
+            return false;
+        }
+        return text === normalizedLang || text === normalizedLang.split('-')[0];
+    }
+
+    function localizedSubtitleLabelForTrack(track) {
+        if (!track) {
+            return '';
+        }
+        const lang = normalizeLang(track.lang || '');
+        if (!lang) {
+            return '';
+        }
+        const currentLabel = cleanLanguageDisplayLabel(track.label || track.displayName || '', lang);
+        if (currentLabel && !isBareLangDisplayLabel(currentLabel, lang)) {
+            return currentLabel;
+        }
+        const option = bestSubtitleOptionForLang(lang, track.sourceUrl || '');
+        const optionLabel = cleanLanguageDisplayLabel(option && option.label || '', lang);
+        return optionLabel && !isBareLangDisplayLabel(optionLabel, lang) ? optionLabel : '';
+    }
+
     function trackDisplayLabel(track) {
         if (!track) {
             return '';
         }
         const lang = normalizeLang(track.lang || '');
-        return cleanLanguageDisplayLabel(track.label || track.displayName || '', lang) || lang || trackCacheKey(track);
+        return localizedSubtitleLabelForTrack(track) || cleanLanguageDisplayLabel(track.label || track.displayName || '', lang) || lang || trackCacheKey(track);
     }
 
     function resolveTrackKey(value) {
@@ -1087,7 +1113,10 @@
             select.appendChild(option);
         });
 
-        tracks.filter(track => !officialTrackKeys.has(trackCacheKey(track)) && !officialLangs.has(normalizeLang(track.lang || ''))).forEach(track => {
+        tracks.filter(track => {
+            const trackLang = normalizeLang(track.lang || '');
+            return !officialTrackKeys.has(trackCacheKey(track)) && (!trackLang || !officialLangs.has(trackLang));
+        }).forEach(track => {
             const option = document.createElement('option');
             const trackKey = trackCacheKey(track);
             option.value = 'cached:' + trackKey;
@@ -1100,11 +1129,23 @@
         parent.appendChild(row);
     }
 
+    function selectorHasAttention() {
+        return !!(state.selectorOpen || state.selectorHover || (state.selectorNode && (state.selectorNode.matches(':hover') || state.selectorNode.contains(document.activeElement))));
+    }
+
+    function keepNetflixControlsVisible() {
+        if (!state.enabled || !selectorHasAttention()) {
+            return;
+        }
+        wakeNetflixControls();
+    }
+
     function showSelectorChrome() {
         if (state.selectorHideTimer) {
             clearTimeout(state.selectorHideTimer);
             state.selectorHideTimer = null;
         }
+        keepNetflixControlsVisible();
         if (!state.selectorVisible) {
             state.selectorVisible = true;
             state.selectorSignature = '';
@@ -1118,7 +1159,7 @@
         }
         state.selectorHideTimer = setTimeout(() => {
             state.selectorHideTimer = null;
-            if (state.selectorOpen || state.selectorHover || (state.selectorNode && (state.selectorNode.matches(':hover') || state.selectorNode.contains(document.activeElement)))) {
+            if (selectorHasAttention()) {
                 return;
             }
             state.selectorVisible = false;
@@ -1193,7 +1234,7 @@
             mergedNativeOptions().map(option => option.key + ':' + option.lang + ':' + ((option.urls || []).length)).join('|'),
             state.nativeScanInProgress ? 'native-scan' : 'native-idle',
             state.nativeScanAttempted ? 'native-tried' : 'native-untried',
-            tracks.map(track => track.lang + ':' + track.cues.length + ':' + (track.savedAt || 0)).join('|')
+            tracks.map(track => trackCacheKey(track) + ':' + track.lang + ':' + trackDisplayLabel(track) + ':' + track.cues.length + ':' + (track.savedAt || 0)).join('|')
         ].join('::');
         if (signature === state.selectorSignature) {
             return;
@@ -2134,9 +2175,19 @@
         if (!target) {
             return;
         }
-        try {
-            target.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, view: window }));
-        } catch (_) {}
+        const rect = target.getBoundingClientRect ? target.getBoundingClientRect() : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+        const eventInit = {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: Math.max(1, Math.round(rect.left + Math.min(rect.width || window.innerWidth, 80))),
+            clientY: Math.max(1, Math.round(rect.top + Math.min(rect.height || window.innerHeight, 80)))
+        };
+        [target, document, window].forEach(node => {
+            try {
+                node.dispatchEvent(new MouseEvent('mousemove', eventInit));
+            } catch (_) {}
+        });
     }
 
     function findNetflixSubtitleButton() {
@@ -2766,6 +2817,7 @@
             document.addEventListener(eventName, ensureRuntimeReady);
         });
         setInterval(ensureRuntimeReady, 1500);
+        setInterval(keepNetflixControlsVisible, 300);
         setInterval(render, RENDER_INTERVAL_MS);
     }
 
