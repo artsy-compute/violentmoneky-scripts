@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.13.14
+// @version      0.13.15
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -921,6 +921,23 @@
         setDisplaySlot(slot, raw.replace(/^cached:/, ''));
     }
 
+    function swapDisplaySubtitleSlots() {
+        state.manualDisplay = true;
+        state.preferenceAppliedDisplay = false;
+        state.displayLangs = [state.displayLangs[1], state.displayLangs[0]]
+            .filter(item => item && state.tracks.has(item))
+            .slice(0, MAX_DISPLAY_LANGS);
+        updateLanguagePreference(target => {
+            const previousPrimary = target.primary;
+            target.primary = target.secondary;
+            target.secondary = previousPrimary;
+        });
+        invalidateSubtitleRender();
+        state.selectorSignature = '';
+        notify('Swapped primary and secondary subtitles');
+        render();
+    }
+
     function clearPendingSubtitleSlot(slot, option = null) {
         delete state.pendingSlotValues[slot];
         if (option && option.lang) {
@@ -1300,6 +1317,19 @@
                 font-size: 13px;
                 font-weight: 600;
             }
+            .nds-swap-row {
+                display: grid;
+                grid-template-columns: 82px minmax(160px, 1fr);
+                align-items: center;
+                gap: 10px;
+                min-height: 34px;
+            }
+            .nds-swap-button {
+                width: 100%;
+                height: 32px;
+                font: 700 12px/1 Arial, sans-serif;
+                text-align: center;
+            }
             .nds-choice-button {
                 min-width: 0;
                 width: 100%;
@@ -1502,6 +1532,10 @@
                 render();
                 return;
             }
+            if (action === 'swap-subtitles') {
+                swapDisplaySubtitleSlots();
+                return;
+            }
             if (action === 'open-picker') {
                 const role = actionNode.dataset ? actionNode.dataset.role : '';
                 state.selectorPickerRole = state.selectorPickerRole === role ? '' : role;
@@ -1655,6 +1689,26 @@
         section.appendChild(row);
 
         parent.appendChild(section);
+    }
+
+    function appendSubtitleSwapChoice(parent) {
+        const row = document.createElement('div');
+        row.className = 'nds-swap-row';
+
+        const label = document.createElement('div');
+        label.className = 'nds-selector-row-label';
+        label.textContent = 'Swap';
+        row.appendChild(label);
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.action = 'swap-subtitles';
+        button.className = 'nds-swap-button';
+        button.textContent = 'Primary ↔ Secondary';
+        button.disabled = state.displayLangs.filter(key => key && state.tracks.has(key)).length < 2;
+        row.appendChild(button);
+
+        parent.appendChild(row);
     }
 
     function appendPickerBlock(parent, title, role, options) {
@@ -2380,6 +2434,7 @@
         if (tracks.length || officialOptions.length) {
             pickerOptions.primary = appendLanguageChoice(panel, 'primary', tracks);
             pickerOptions.secondary = appendLanguageChoice(panel, 'secondary', tracks);
+            appendSubtitleSwapChoice(panel);
         }
         if (state.selectorPickerRole && pickerOptions[state.selectorPickerRole]) {
             const pickerTitle = state.selectorPickerRole === 'audio' ? 'Audio' : state.selectorPickerRole === 'primary' ? 'Primary' : 'Secondary';
@@ -3948,19 +4003,7 @@
             return;
         }
 
-        GM_registerMenuCommand('Netflix Dual Subtitles: Switch main/secondary', () => {
-            state.manualDisplay = true;
-            state.preferenceAppliedDisplay = false;
-            state.displayLangs.reverse();
-            updateLanguagePreference(target => {
-                const previousPrimary = target.primary;
-                target.primary = target.secondary;
-                target.secondary = previousPrimary;
-            });
-            invalidateSubtitleRender();
-            state.selectorSignature = '';
-            render();
-        });
+        GM_registerMenuCommand('Netflix Dual Subtitles: Switch main/secondary', () => swapDisplaySubtitleSlots());
         GM_registerMenuCommand('Netflix Dual Subtitles: Toggle native Netflix subtitles', () => {
             state.hideNative = !state.hideNative;
             saveHideNativePreference(state.hideNative);
