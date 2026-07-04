@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.13.24
+// @version      0.13.26
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -34,6 +34,7 @@
     const HIDE_NATIVE_PREF_KEY = 'netflix-dual-subtitles:hide-native';
     const LANGUAGE_PREF_KEY = 'netflix-dual-subtitles:language-preferences:v1';
     const TRANSCRIPT_OPACITY_PREF_KEY = 'netflix-dual-subtitles:transcript-opacity';
+    const TRANSCRIPT_FONT_SIZE_PREF_KEY = 'netflix-dual-subtitles:transcript-font-size';
 
     function loadHideNativePreference() {
         try {
@@ -68,6 +69,28 @@
     function saveTranscriptOpacityPreference(value) {
         try {
             localStorage.setItem(TRANSCRIPT_OPACITY_PREF_KEY, String(clampTranscriptOpacity(value)));
+        } catch (_) {}
+    }
+
+    function clampTranscriptFontSize(value) {
+        const fontSize = Number(value);
+        if (!Number.isFinite(fontSize)) {
+            return 12;
+        }
+        return Math.min(22, Math.max(10, fontSize));
+    }
+
+    function loadTranscriptFontSizePreference() {
+        try {
+            return clampTranscriptFontSize(localStorage.getItem(TRANSCRIPT_FONT_SIZE_PREF_KEY) || 12);
+        } catch (_) {
+            return 12;
+        }
+    }
+
+    function saveTranscriptFontSizePreference(value) {
+        try {
+            localStorage.setItem(TRANSCRIPT_FONT_SIZE_PREF_KEY, String(clampTranscriptFontSize(value)));
         } catch (_) {}
     }
 
@@ -124,6 +147,7 @@
         transcriptToggleNode: null,
         transcriptSignature: '',
         transcriptOpacity: loadTranscriptOpacityPreference(),
+        transcriptFontSize: loadTranscriptFontSizePreference(),
         transcriptScrollToCurrent: false,
         transcriptLastCueIndex: -1,
         transcriptUserScrollUntil: 0,
@@ -1369,6 +1393,7 @@
                 box-shadow: 0 8px 24px rgba(0,0,0,.55);
                 color: #fff;
                 font: 13px/1.35 Arial, sans-serif;
+                --nds-transcript-font-size: 12px;
                 pointer-events: auto;
                 z-index: 2147483647;
             }
@@ -1377,14 +1402,15 @@
             }
             .nds-transcript-title {
                 display: grid;
-                grid-template-columns: minmax(0, 1fr) auto auto;
+                grid-template-columns: minmax(0, 1fr) auto auto auto;
                 align-items: center;
                 gap: 10px;
                 color: #fff;
                 font-size: 14px;
                 font-weight: 700;
             }
-            .nds-transcript-opacity {
+            .nds-transcript-opacity,
+            .nds-transcript-font-size {
                 display: grid;
                 grid-template-columns: auto 88px;
                 align-items: center;
@@ -1393,7 +1419,8 @@
                 font-size: 12px;
                 font-weight: 600;
             }
-            .nds-transcript-opacity input {
+            .nds-transcript-opacity input,
+            .nds-transcript-font-size input {
                 width: 88px;
                 accent-color: #e50914;
             }
@@ -1562,6 +1589,8 @@
             }
             .nds-transcript-list {
                 display: grid;
+                grid-auto-rows: max-content;
+                align-content: start;
                 gap: 2px;
                 min-height: 180px;
                 max-height: min(62vh, 620px);
@@ -1574,10 +1603,12 @@
             .nds-transcript-row {
                 display: grid;
                 grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+                align-items: start;
                 gap: 8px;
                 width: 100%;
-                min-height: 34px;
-                padding: 6px 7px;
+                min-height: calc(var(--nds-transcript-font-size, 12px) * 2.4);
+                height: auto;
+                padding: calc(var(--nds-transcript-font-size, 12px) * .5) 7px;
                 border: 0;
                 border-radius: 3px;
                 background: rgba(255,255,255,.055);
@@ -1595,15 +1626,20 @@
             }
             .nds-transcript-cell {
                 min-width: 0;
+                display: block;
                 overflow-wrap: anywhere;
-                font-size: 12px;
-                line-height: 1.25;
+                white-space: normal;
+                font-size: var(--nds-transcript-font-size, 12px);
+                line-height: 1.35;
             }
             .nds-transcript-time {
+                display: inline-block;
                 color: #aaa;
-                font-size: 11px;
+                font-size: max(11px, calc(var(--nds-transcript-font-size, 12px) * .82));
+                line-height: inherit;
                 font-weight: 700;
                 margin-right: 5px;
+                vertical-align: baseline;
             }
             .nds-selector-empty {
                 color: #b3b3b3;
@@ -1758,13 +1794,20 @@
         });
         transcriptNode.addEventListener('input', event => {
             const target = event.target;
-            if (!target || target.dataset.role !== 'transcript-opacity') {
+            const role = target && target.dataset ? target.dataset.role : '';
+            if (role === 'transcript-opacity') {
+                state.transcriptOpacity = clampTranscriptOpacity(target.value);
+                saveTranscriptOpacityPreference(state.transcriptOpacity);
+                state.transcriptNode.style.setProperty('--nds-transcript-opacity', String(state.transcriptOpacity));
+                state.transcriptSignature = '';
                 return;
             }
-            state.transcriptOpacity = clampTranscriptOpacity(target.value);
-            saveTranscriptOpacityPreference(state.transcriptOpacity);
-            state.transcriptNode.style.setProperty('--nds-transcript-opacity', String(state.transcriptOpacity));
-            state.transcriptSignature = '';
+            if (role === 'transcript-font-size') {
+                state.transcriptFontSize = clampTranscriptFontSize(target.value);
+                saveTranscriptFontSizePreference(state.transcriptFontSize);
+                state.transcriptNode.style.setProperty('--nds-transcript-font-size', state.transcriptFontSize + 'px');
+                state.transcriptSignature = '';
+            }
         });
         transcriptNode.addEventListener('click', event => {
             const actionNode = event.target && event.target.closest ? event.target.closest('[data-action]') : null;
@@ -2754,12 +2797,14 @@
         const signature = [
             state.transcriptOpen ? 'open' : 'closed',
             state.transcriptOpacity,
+            state.transcriptFontSize,
             state.displayLangs.join(','),
             primaryTrack ? trackCacheKey(primaryTrack) + ':' + primaryTrack.cues.length + ':' + (primaryTrack.savedAt || 0) : '',
             secondaryTrack ? trackCacheKey(secondaryTrack) + ':' + secondaryTrack.cues.length + ':' + (secondaryTrack.savedAt || 0) : ''
         ].join('::');
         const controlsVisible = state.bottomControlsVisible && netflixBottomControlsVisibleNow();
         state.transcriptNode.style.setProperty('--nds-transcript-opacity', String(state.transcriptOpacity));
+        state.transcriptNode.style.setProperty('--nds-transcript-font-size', state.transcriptFontSize + 'px');
         state.transcriptToggleNode.classList.toggle('is-active', state.transcriptOpen);
         state.transcriptToggleNode.classList.toggle('is-hidden', !controlsVisible && !state.transcriptOpen);
         state.transcriptNode.classList.toggle('is-open', state.transcriptOpen);
@@ -2791,6 +2836,20 @@
         opacityLabel.appendChild(opacityText);
         opacityLabel.appendChild(opacityInput);
 
+        const fontSizeLabel = document.createElement('label');
+        fontSizeLabel.className = 'nds-transcript-font-size';
+        const fontSizeText = document.createElement('span');
+        fontSizeText.textContent = 'Size';
+        const fontSizeInput = document.createElement('input');
+        fontSizeInput.type = 'range';
+        fontSizeInput.min = '10';
+        fontSizeInput.max = '22';
+        fontSizeInput.step = '1';
+        fontSizeInput.value = String(state.transcriptFontSize);
+        fontSizeInput.dataset.role = 'transcript-font-size';
+        fontSizeLabel.appendChild(fontSizeText);
+        fontSizeLabel.appendChild(fontSizeInput);
+
         const closeButton = document.createElement('button');
         closeButton.type = 'button';
         closeButton.className = 'nds-transcript-close';
@@ -2798,6 +2857,7 @@
         closeButton.textContent = 'Close';
         title.appendChild(titleText);
         title.appendChild(opacityLabel);
+        title.appendChild(fontSizeLabel);
         title.appendChild(closeButton);
         state.transcriptNode.appendChild(title);
 
