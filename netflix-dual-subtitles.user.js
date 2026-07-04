@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.11.5
+// @version      0.11.6
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -705,6 +705,17 @@
                 opacity: 0 !important;
                 pointer-events: none !important;
             }
+            html.nds-selector-attention [class*="watch-video--bottom-controls-container"],
+            html.nds-selector-attention div:has(> [data-uia="controls-standard"]),
+            html.nds-selector-attention div:has([data-uia="controls-standard"]),
+            html.nds-selector-attention [data-uia="controls-standard"],
+            html.nds-selector-attention [data-uia="timeline"],
+            html.nds-selector-attention [data-uia^="control-"] {
+                opacity: 1 !important;
+                visibility: visible !important;
+                transform: none !important;
+                pointer-events: auto !important;
+            }
             .nds-lines {
                 max-width: min(96vw, 1680px);
                 display: grid;
@@ -1012,6 +1023,7 @@
     function applyNativeSubtitleVisibility() {
         document.documentElement.classList.toggle('nds-hide-native-subtitles', state.hideNative);
         document.documentElement.classList.toggle('nds-addon-active', state.enabled);
+        document.documentElement.classList.toggle('nds-selector-attention', state.enabled && selectorHasAttention());
     }
 
     function appendSelectorIconButton(parent, action, active) {
@@ -1134,7 +1146,9 @@
     }
 
     function keepNetflixControlsVisible() {
-        if (!state.enabled || !selectorHasAttention()) {
+        const hasAttention = state.enabled && selectorHasAttention();
+        document.documentElement.classList.toggle('nds-selector-attention', hasAttention);
+        if (!hasAttention) {
             return;
         }
         wakeNetflixControls();
@@ -2186,6 +2200,9 @@
         [target, document, window].forEach(node => {
             try {
                 node.dispatchEvent(new MouseEvent('mousemove', eventInit));
+            } catch (_) {}
+            try {
+                node.dispatchEvent(new PointerEvent('pointermove', eventInit));
             } catch (_) {}
         });
     }
