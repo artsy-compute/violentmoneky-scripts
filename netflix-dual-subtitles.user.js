@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.13.9
+// @version      0.13.11
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -73,6 +73,7 @@
         selectedAudioKey: '',
         nativeScanInProgress: false,
         nativeScanAttempted: false,
+        nativeCacheRefreshScheduled: false,
         prefetchQueue: [],
         prefetchActive: false,
         prefetchedOptionKeys: new Set(),
@@ -252,6 +253,41 @@
         return parts[0] + '-' + parts.slice(1).map(part => part.length === 2 ? part.toUpperCase() : part).join('-');
     }
 
+    function langPrimary(lang) {
+        return normalizeLang(lang).split('-')[0] || '';
+    }
+
+    function languageMatchScore(a, b) {
+        const left = normalizeLang(a);
+        const right = normalizeLang(b);
+        if (!left || !right) {
+            return Number.POSITIVE_INFINITY;
+        }
+        if (left === right) {
+            return 0;
+        }
+
+        const leftPrimary = langPrimary(left);
+        const rightPrimary = langPrimary(right);
+        if (!leftPrimary || leftPrimary !== rightPrimary) {
+            return Number.POSITIVE_INFINITY;
+        }
+
+        const leftBare = left === leftPrimary;
+        const rightBare = right === rightPrimary;
+        if (leftPrimary === 'zh') {
+            return leftBare || rightBare ? 4 : Number.POSITIVE_INFINITY;
+        }
+        if (leftPrimary === 'en') {
+            return leftBare || rightBare ? 3 : 7;
+        }
+        return leftBare || rightBare ? 5 : 9;
+    }
+
+    function languagesCompatible(a, b) {
+        return Number.isFinite(languageMatchScore(a, b));
+    }
+
     function normalizeTrackKey(value) {
         return String(value || '').trim();
     }
@@ -417,20 +453,60 @@
         }
     }
 
+    function nativeManifestSubtitleScore(nativeOption, manifestOption) {
+        const langScore = languageMatchScore(nativeOption && nativeOption.lang || '', manifestOption && manifestOption.lang || '');
+        if (!Number.isFinite(langScore)) {
+            return Number.POSITIVE_INFINITY;
+        }
+        let score = langScore * 10;
+        if (optionLabelIdentity(nativeOption.label) !== optionLabelIdentity(manifestOption.label)) {
+            score += 2;
+        }
+        if (subtitleBaseLabelIdentity(nativeOption.label) !== subtitleBaseLabelIdentity(manifestOption.label)) {
+            score += 4;
+        }
+        if (isCcSubtitleLabel(nativeOption.label) !== isCcSubtitleLabel(manifestOption.label)) {
+            score += 8;
+        }
+        return score + subtitleVariantScore(manifestOption) / 100;
+    }
+
+    function bestManifestSubtitleForNative(nativeOption, usedKeys = new Set()) {
+        if (!nativeOption) {
+            return null;
+        }
+        return state.manifestOptions
+            .filter(option => option && option.key && !usedKeys.has(option.key) && Array.isArray(option.urls) && option.urls.length)
+            .map(option => ({ option, score: nativeManifestSubtitleScore(nativeOption, option) }))
+            .filter(item => Number.isFinite(item.score))
+            .sort((a, b) => a.score - b.score || a.option.label.localeCompare(b.option.label))[0]?.option || null;
+    }
+
     function mergedNativeOptions() {
         const merged = new Map();
-        const nativeLangs = new Set(state.nativeOptions.map(option => normalizeLang(option && option.lang || '')).filter(Boolean));
-        state.nativeOptions.forEach(option => {
-            if (option && option.key) {
-                merged.set(option.key, option);
-            }
-        });
-        state.manifestOptions.forEach(option => {
-            if (!option || !option.key) {
+        const usedManifestKeys = new Set();
+
+        state.nativeOptions.forEach(nativeOption => {
+            if (!nativeOption || !nativeOption.key) {
                 return;
             }
-            const lang = normalizeLang(option.lang || '');
-            if (lang && nativeLangs.has(lang)) {
+            const manifestOption = bestManifestSubtitleForNative(nativeOption, usedManifestKeys);
+            if (manifestOption) {
+                usedManifestKeys.add(manifestOption.key);
+                merged.set(manifestOption.key, {
+                    ...manifestOption,
+                    label: cleanLanguageDisplayLabel(nativeOption.label, manifestOption.lang || nativeOption.lang) || nativeOption.label,
+                    nativeKey: nativeOption.key,
+                    nativeLabel: nativeOption.label,
+                    source: manifestOption.source || 'manifest'
+                });
+                return;
+            }
+            merged.set(nativeOption.key, nativeOption);
+        });
+
+        state.manifestOptions.forEach(option => {
+            if (!option || !option.key || usedManifestKeys.has(option.key)) {
                 return;
             }
             merged.set(option.key, option);
@@ -479,13 +555,24 @@
         }
         const optionLang = normalizeLang(option.lang || '');
         if (optionLang) {
-            const sameLang = Array.from(state.tracks.values()).filter(track => normalizeLang(track.lang || '') === optionLang);
-            if (sameLang.length === 1) {
-                return trackCacheKey(sameLang[0]);
-            }
-            const sameLabel = sameLang.find(track => optionLabelIdentity(trackDisplayLabel(track)) === optionLabelIdentity(option.label));
+            const tracksByScore = Array.from(state.tracks.values())
+                .map(track => ({ track, score: languageMatchScore(track.lang || '', optionLang) }))
+                .filter(item => Number.isFinite(item.score))
+                .sort((a, b) => a.score - b.score || (b.track.savedAt || 0) - (a.track.savedAt || 0));
+            const exactLang = tracksByScore.filter(item => item.score === 0);
+            const sameLabel = tracksByScore.find(item => optionLabelIdentity(trackDisplayLabel(item.track)) === optionLabelIdentity(option.label));
             if (sameLabel) {
-                return trackCacheKey(sameLabel);
+                return trackCacheKey(sameLabel.track);
+            }
+            const sameCc = tracksByScore.filter(item => isCcSubtitleLabel(trackDisplayLabel(item.track)) === isCcSubtitleLabel(option.label));
+            if (exactLang.length === 1) {
+                return trackCacheKey(exactLang[0].track);
+            }
+            if (sameCc.length === 1) {
+                return trackCacheKey(sameCc[0].track);
+            }
+            if (tracksByScore.length === 1) {
+                return trackCacheKey(tracksByScore[0].track);
             }
         }
         return '';
@@ -496,7 +583,11 @@
         if (!normalized) {
             return null;
         }
-        const options = mergedNativeOptions().filter(option => normalizeLang(option.lang || '') === normalized);
+        const options = mergedNativeOptions()
+            .map(option => ({ option, score: languageMatchScore(option.lang || '', normalized) }))
+            .filter(item => Number.isFinite(item.score))
+            .sort((a, b) => a.score - b.score || subtitleVariantScore(a.option) - subtitleVariantScore(b.option) || a.option.label.localeCompare(b.option.label))
+            .map(item => item.option);
         if (!options.length) {
             return null;
         }
@@ -505,6 +596,10 @@
             if (byUrl) {
                 return byUrl;
             }
+        }
+        const exact = options.find(option => normalizeLang(option.lang || '') === normalized);
+        if (exact) {
+            return exact;
         }
         const native = options.find(option => /^native-/.test(option.source || '') || /^subtitle:/.test(option.key || ''));
         return native || options[0];
@@ -730,6 +825,7 @@
         state.selectedAudioKey = '';
         state.nativeScanInProgress = false;
         state.nativeScanAttempted = false;
+        state.nativeCacheRefreshScheduled = false;
         state.prefetchQueue = [];
         state.prefetchActive = false;
         state.prefetchedOptionKeys.clear();
@@ -1700,6 +1796,7 @@
         try {
             new MutationObserver(mutations => {
                 observeNetflixPlayers();
+                scheduleNativeOptionCacheRefresh();
                 if (!selectorShouldHoldNetflixControls()) {
                     return;
                 }
@@ -1743,6 +1840,17 @@
         if (changed) {
             state.status = 'cached visible Netflix audio/subtitle languages';
         }
+    }
+
+    function scheduleNativeOptionCacheRefresh() {
+        if (state.nativeCacheRefreshScheduled || !state.enabled || state.nativeScanInProgress) {
+            return;
+        }
+        state.nativeCacheRefreshScheduled = true;
+        setTimeout(() => {
+            state.nativeCacheRefreshScheduled = false;
+            cacheVisibleNativeOptions();
+        }, 80);
     }
 
     function showSelectorChrome() {
@@ -2415,7 +2523,6 @@
         saveOptionCache();
         state.selectorSignature = '';
         renderSelector();
-        prepopulateManifestOptionContent(options);
         return options.length + audioOptions.length;
     }
 
@@ -3244,7 +3351,11 @@
         }
 
         const targetLang = option.lang || langFromNativeLabel(option.label);
-        const sameLang = targetLang ? candidates.filter(item => item.lang === targetLang) : [];
+        const sameLang = targetLang ? candidates
+            .map(item => ({ item, score: languageMatchScore(item.lang, targetLang) }))
+            .filter(entry => Number.isFinite(entry.score))
+            .sort((a, b) => a.score - b.score || subtitleVariantScore(a.item) - subtitleVariantScore(b.item))
+            .map(entry => entry.item) : [];
         if (sameLang.length === 1) {
             return sameLang[0].element;
         }
@@ -3309,7 +3420,11 @@
         }
 
         const targetLang = option.lang || langFromNativeLabel(option.label);
-        const sameLang = targetLang ? candidates.filter(item => item.lang === targetLang) : [];
+        const sameLang = targetLang ? candidates
+            .map(item => ({ item, score: languageMatchScore(item.lang, targetLang) }))
+            .filter(entry => Number.isFinite(entry.score))
+            .sort((a, b) => a.score - b.score || audioLabelIdentity(a.item.label).localeCompare(audioLabelIdentity(b.item.label)))
+            .map(entry => entry.item) : [];
         if (sameLang.length === 1) {
             return sameLang[0].element;
         }
