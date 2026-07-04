@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.13.13
+// @version      0.13.14
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -32,6 +32,7 @@
     const CUE_START_TOLERANCE_MS = 80;
     const CUE_END_TOLERANCE_MS = 120;
     const HIDE_NATIVE_PREF_KEY = 'netflix-dual-subtitles:hide-native';
+    const LANGUAGE_PREF_KEY = 'netflix-dual-subtitles:language-preferences:v1';
 
     function loadHideNativePreference() {
         try {
@@ -63,6 +64,7 @@
         videoId: '',
         displayLangs: [],
         manualDisplay: false,
+        preferenceAppliedDisplay: false,
         selectorOpen: false,
         selectorVisible: true,
         selectorHover: false,
@@ -77,6 +79,9 @@
         nativeScanInProgress: false,
         nativeScanAttempted: false,
         nativeCacheRefreshScheduled: false,
+        preferenceApplyScheduled: false,
+        preferenceApplyInProgress: false,
+        preferenceApplySignature: '',
         prefetchQueue: [],
         prefetchActive: false,
         prefetchedOptionKeys: new Set(),
@@ -123,6 +128,83 @@
 
     function optionCacheKey() {
         return cachePrefix() + '__options';
+    }
+
+    function loadLanguagePreferences() {
+        try {
+            const payload = JSON.parse(localStorage.getItem(LANGUAGE_PREF_KEY) || '{}');
+            return payload && typeof payload === 'object' ? payload : {};
+        } catch (_) {
+            return {};
+        }
+    }
+
+    function saveLanguagePreferences(payload) {
+        try {
+            localStorage.setItem(LANGUAGE_PREF_KEY, JSON.stringify(payload));
+        } catch (_) {}
+    }
+
+    function currentTitlePreferenceKey() {
+        const titleNode = document.querySelector('[data-uia="video-title"] h4') || document.querySelector('[data-uia="video-title"]');
+        const title = normalizeNativeLabel(titleNode ? titleNode.textContent || '' : '');
+        if (!title) {
+            return '';
+        }
+        return 'title:' + title.toLowerCase();
+    }
+
+    function preferenceIdentityForSubtitle(item) {
+        if (!item) {
+            return null;
+        }
+        const lang = normalizeLang(item.lang || '');
+        const label = cleanLanguageDisplayLabel(item.label || item.displayName || '', lang) || item.label || lang;
+        return {
+            lang,
+            label: normalizeNativeLabel(label),
+            identity: optionLabelIdentity(label),
+            base: subtitleBaseLabelIdentity(label),
+            cc: isCcSubtitleLabel(label)
+        };
+    }
+
+    function preferenceIdentityForAudio(item) {
+        if (!item) {
+            return null;
+        }
+        const lang = normalizeLang(item.lang || '');
+        const label = cleanLanguageDisplayLabel(item.label || item.displayName || '', lang) || item.label || lang;
+        return {
+            lang,
+            label: normalizeNativeLabel(label),
+            identity: audioLabelIdentity(label),
+            description: isAudioDescriptionLabel(label)
+        };
+    }
+
+    function updateLanguagePreference(mutator) {
+        if (state.preferenceApplyInProgress) {
+            return;
+        }
+        const preferences = loadLanguagePreferences();
+        preferences.last = preferences.last || {};
+        mutator(preferences.last);
+        const titleKey = currentTitlePreferenceKey();
+        if (titleKey) {
+            preferences.titles = preferences.titles || {};
+            preferences.titles[titleKey] = preferences.titles[titleKey] || {};
+            mutator(preferences.titles[titleKey]);
+        }
+        preferences.updatedAt = Date.now();
+        saveLanguagePreferences(preferences);
+        state.preferenceApplySignature = '';
+    }
+
+    function storedLanguagePreference() {
+        const preferences = loadLanguagePreferences();
+        const titleKey = currentTitlePreferenceKey();
+        return { ...(preferences.last || {}), ...(titleKey && preferences.titles ? preferences.titles[titleKey] || {} : {}) };
     }
 
     function normalizeNativeLabel(label) {
@@ -613,6 +695,148 @@
         return !!cachedTrackKeyForOption(option);
     }
 
+    function subtitlePreferenceScore(preference, item) {
+        if (!preference || preference.off || !item) {
+            return Number.POSITIVE_INFINITY;
+        }
+        const identity = preferenceIdentityForSubtitle(item);
+        if (!identity || !identity.lang) {
+            return Number.POSITIVE_INFINITY;
+        }
+        const langScore = languageMatchScore(preference.lang, identity.lang);
+        if (!Number.isFinite(langScore)) {
+            return Number.POSITIVE_INFINITY;
+        }
+        let score = langScore * 100;
+        if (preference.identity && identity.identity && preference.identity !== identity.identity) {
+            score += 8;
+        }
+        if (preference.base && identity.base && preference.base !== identity.base) {
+            score += 12;
+        }
+        if (preference.cc !== identity.cc) {
+            score += 30;
+        }
+        return score + subtitleVariantScore(item) / 10;
+    }
+
+    function audioPreferenceScore(preference, item) {
+        if (!preference || preference.off || !item) {
+            return Number.POSITIVE_INFINITY;
+        }
+        const identity = preferenceIdentityForAudio(item);
+        if (!identity || !identity.lang) {
+            return Number.POSITIVE_INFINITY;
+        }
+        const langScore = languageMatchScore(preference.lang, identity.lang);
+        if (!Number.isFinite(langScore)) {
+            return Number.POSITIVE_INFINITY;
+        }
+        let score = langScore * 100;
+        if (preference.identity && identity.identity && preference.identity !== identity.identity) {
+            score += 10;
+        }
+        if (preference.description !== identity.description) {
+            score += 40;
+        }
+        return score;
+    }
+
+    function bestSubtitlePreferenceMatch(preference) {
+        const trackMatches = Array.from(state.tracks.values())
+            .map(track => ({ type: 'track', track, score: subtitlePreferenceScore(preference, track) }))
+            .filter(item => Number.isFinite(item.score))
+            .sort((a, b) => a.score - b.score || (b.track.savedAt || 0) - (a.track.savedAt || 0));
+        if (trackMatches.length) {
+            return trackMatches[0];
+        }
+        return mergedNativeOptions()
+            .map(option => ({ type: 'option', option, score: subtitlePreferenceScore(preference, option) }))
+            .filter(item => Number.isFinite(item.score))
+            .sort((a, b) => a.score - b.score || a.option.label.localeCompare(b.option.label))[0] || null;
+    }
+
+    function bestAudioPreferenceMatch(preference) {
+        return mergedAudioOptions()
+            .map(option => ({ option, score: audioPreferenceScore(preference, option) }))
+            .filter(item => Number.isFinite(item.score))
+            .sort((a, b) => a.score - b.score || a.option.label.localeCompare(b.option.label))[0]?.option || null;
+    }
+
+    function preferenceApplySignature(preference) {
+        return [
+            currentContextVideoId(),
+            currentTitlePreferenceKey(),
+            JSON.stringify(preference || {}),
+            state.manualDisplay ? 'manual' : 'auto',
+            state.displayLangs.join(','),
+            state.selectedAudioKey,
+            Array.from(state.tracks.values()).map(track => trackCacheKey(track) + ':' + track.lang + ':' + trackDisplayLabel(track)).join('|'),
+            mergedNativeOptions().map(option => option.key + ':' + option.lang + ':' + option.label + ':' + ((option.urls || []).length)).join('|'),
+            mergedAudioOptions().map(option => option.key + ':' + option.lang + ':' + option.label).join('|')
+        ].join('::');
+    }
+
+    function scheduleApplyLanguagePreferences() {
+        if (state.preferenceApplyScheduled || state.preferenceApplyInProgress) {
+            return;
+        }
+        state.preferenceApplyScheduled = true;
+        setTimeout(() => {
+            state.preferenceApplyScheduled = false;
+            applyLanguagePreferences();
+        }, 120);
+    }
+
+    async function applyLanguagePreferences() {
+        if (state.preferenceApplyInProgress || !state.enabled || !currentContextVideoId()) {
+            return;
+        }
+        const preference = storedLanguagePreference();
+        if (!preference.primary && !preference.secondary && !preference.audio) {
+            return;
+        }
+        const signature = preferenceApplySignature(preference);
+        if (signature === state.preferenceApplySignature) {
+            return;
+        }
+        state.preferenceApplySignature = signature;
+        if (state.manualDisplay && state.displayLangs.length && !state.preferenceAppliedDisplay) {
+            return;
+        }
+
+        const requestVideoId = currentContextVideoId();
+        state.preferenceApplyInProgress = true;
+        try {
+            for (const role of ['primary', 'secondary']) {
+                const item = preference[role];
+                if (!item || item.off || currentContextVideoId() !== requestVideoId) {
+                    continue;
+                }
+                const match = bestSubtitlePreferenceMatch(item);
+                if (!match) {
+                    continue;
+                }
+                if (match.type === 'track') {
+                    setDisplaySlot(role, trackCacheKey(match.track));
+                } else if (match.option && Array.isArray(match.option.urls) && match.option.urls.length) {
+                    await fetchOfficialSubtitleForSlot(role, match.option);
+                }
+            }
+
+            if (preference.audio && !preference.audio.off && !state.selectedAudioKey && state.bottomControlsVisible && netflixBottomControlsVisibleNow()) {
+                const audioOption = bestAudioPreferenceMatch(preference.audio);
+                if (audioOption && currentContextVideoId() === requestVideoId) {
+                    await selectOfficialAudio(audioOption.key);
+                }
+            }
+        } finally {
+            state.preferenceApplyInProgress = false;
+            state.selectorSignature = '';
+            render();
+        }
+    }
+
     function latestTrackKeys() {
         return Array.from(state.tracks.values())
             .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0))
@@ -665,6 +889,7 @@
         const next = state.displayLangs.filter(item => state.tracks.has(item));
 
         state.manualDisplay = true;
+        state.preferenceAppliedDisplay = !!state.preferenceApplyInProgress;
         if (!normalizeTrackKey(value)) {
             next.splice(index, 1);
         } else if (key && state.tracks.has(key)) {
@@ -674,6 +899,13 @@
         }
 
         state.displayLangs = next.filter((item, itemIndex, array) => item && array.indexOf(item) === itemIndex).slice(0, MAX_DISPLAY_LANGS);
+        if (!state.preferenceApplyInProgress) {
+            const preference = key ? preferenceIdentityForSubtitle(state.tracks.get(key)) : { off: true };
+            const preferenceRole = index === 0 ? 'primary' : 'secondary';
+            updateLanguagePreference(target => {
+                target[preferenceRole] = preference;
+            });
+        }
         scheduleSubtitleRender();
         state.selectorSignature = '';
         delete state.pendingSlotValues[index === 0 ? 'primary' : 'secondary'];
@@ -842,6 +1074,7 @@
         state.displayLangs = [];
         clearSubtitleOverlay();
         state.manualDisplay = false;
+        state.preferenceAppliedDisplay = false;
         state.nativeOptions = [];
         state.manifestOptions = [];
         state.nativeAudioOptions = [];
@@ -1911,6 +2144,7 @@
         }
         if (changed) {
             state.status = 'cached visible Netflix audio/subtitle languages';
+            scheduleApplyLanguagePreferences();
         }
     }
 
@@ -2623,6 +2857,7 @@
         saveOptionCache();
         state.selectorSignature = '';
         renderSelector();
+        scheduleApplyLanguagePreferences();
         return options.length + audioOptions.length;
     }
 
@@ -2792,6 +3027,7 @@
 
         const requestVideoId = currentContextVideoId();
         state.manualDisplay = true;
+        state.preferenceAppliedDisplay = !!state.preferenceApplyInProgress;
         state.pendingSlotValues[slot] = 'official:' + option.key;
         if (option.lang) {
             state.pendingSlots[option.key] = slot;
@@ -3571,6 +3807,11 @@
         await sleep(60);
         await clickNativeMediaElement(element);
         state.selectedAudioKey = option.key;
+        if (!state.preferenceApplyInProgress) {
+            updateLanguagePreference(target => {
+                target.audio = preferenceIdentityForAudio(option);
+            });
+        }
         state.selectorSignature = '';
         renderSelector();
         notify('Selected Netflix audio: ' + option.label);
@@ -3587,12 +3828,18 @@
             notify('Netflix subtitle option not found');
             return false;
         }
+        if (!state.preferenceApplyInProgress) {
+            updateLanguagePreference(target => {
+                target[slot] = preferenceIdentityForSubtitle(option);
+            });
+        }
 
         if (await fetchOfficialSubtitleForSlot(slot, option)) {
             return true;
         }
 
         state.manualDisplay = true;
+        state.preferenceAppliedDisplay = !!state.preferenceApplyInProgress;
         state.pendingSlotValues[slot] = 'official:' + option.key;
         if (option.lang) {
             state.pendingSlots[option.key] = slot;
@@ -3638,6 +3885,7 @@
         state.displayLangs = [];
         clearSubtitleOverlay();
         state.manualDisplay = false;
+        state.preferenceAppliedDisplay = false;
         state.nativeOptions = [];
         state.manifestOptions = [];
         state.nativeAudioOptions = [];
@@ -3664,6 +3912,7 @@
             notify(state.status);
         }
         render();
+        scheduleApplyLanguagePreferences();
     }
 
     function checkWatchIdChange(initial = false) {
@@ -3701,8 +3950,14 @@
 
         GM_registerMenuCommand('Netflix Dual Subtitles: Switch main/secondary', () => {
             state.manualDisplay = true;
+            state.preferenceAppliedDisplay = false;
             state.displayLangs.reverse();
-            state.lastText = '';
+            updateLanguagePreference(target => {
+                const previousPrimary = target.primary;
+                target.primary = target.secondary;
+                target.secondary = previousPrimary;
+            });
+            invalidateSubtitleRender();
             state.selectorSignature = '';
             render();
         });
@@ -3728,6 +3983,7 @@
             createOverlay();
         }
         render();
+        scheduleApplyLanguagePreferences();
     }
 
     function init() {
