@@ -1542,6 +1542,31 @@
         }
     }
 
+    function clearSelectorControlHostTargets() {
+        document.querySelectorAll('[data-nds-selector-host]').forEach(element => {
+            element.removeAttribute('data-nds-selector-host');
+        });
+    }
+
+    function addSelectorControlHostTargets(targets) {
+        const selector = state.selectorNode;
+        if (!selector || !document.documentElement.contains(selector)) {
+            return;
+        }
+
+        let element = selector;
+        for (let depth = 0; element && depth < 12; depth += 1) {
+            addNetflixControlForceTarget(targets, element);
+            if (element.matches && element.matches('[class*="watch-video--bottom-controls-container"]')) {
+                element.setAttribute('data-nds-selector-host', '1');
+            }
+            if (element.matches && element.matches('[data-uia="player"]')) {
+                break;
+            }
+            element = element.parentElement;
+        }
+    }
+
     function netflixControlForceTargets() {
         const targets = new Set();
         document.querySelectorAll('[data-uia="player"], [class*="watch-video--bottom-controls-container"], [data-uia="controls-standard"], [data-uia="timeline"], [data-uia^="control-"]').forEach(element => {
@@ -1555,12 +1580,16 @@
                 parent = parent.parentElement;
             }
         });
+        addSelectorControlHostTargets(targets);
         return Array.from(targets);
     }
 
     function shouldForceControlDisplay(element) {
         if (!element || !element.matches) {
             return false;
+        }
+        if (element.hasAttribute('data-nds-selector-host')) {
+            return true;
         }
         if (element.matches('[class*="watch-video--bottom-controls-container"]')) {
             return true;
@@ -1599,6 +1628,7 @@
 
     function releaseNetflixControlHold() {
         document.documentElement.classList.remove('nds-selector-attention');
+        clearSelectorControlHostTargets();
         restoreNetflixControlForceStyles();
         restorePlayerStateClasses();
     }
@@ -1800,7 +1830,7 @@
     }
 
     function selectorShouldMountInNetflixControls() {
-        return !!(state.enabled && (selectorIsAppearing() || selectorHasAttention()));
+        return !!state.enabled;
     }
 
     function mountSelectorNode() {
