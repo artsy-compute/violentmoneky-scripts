@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      0.13.11
+// @version      0.13.12
 // @description  Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @description:en Load Netflix audio/subtitle languages; switch audio through Netflix and display two subtitles together.
 // @author       artsy-compute
@@ -56,6 +56,7 @@
         controlForcedStyles: new Map(),
         controlForcedPlayerClasses: new Map(),
         observedPlayers: new WeakSet(),
+        bottomControlsVisible: true,
         historyPatched: false,
         videoId: '',
         displayLangs: [],
@@ -983,7 +984,8 @@
                 transition: opacity .18s ease, transform .18s ease;
                 z-index: 2147483647;
             }
-            .nds-selector.is-idle {
+            .nds-selector.is-idle,
+            .nds-selector.is-control-hidden {
                 opacity: 0;
                 pointer-events: none;
                 transform: translateX(8px);
@@ -1521,7 +1523,7 @@
     }
 
     function selectorShouldHoldNetflixControls() {
-        return !!(state.enabled && (selectorDomIsVisible() || selectorIsAppearing() || selectorPanelIsPresent() || selectorHasAttention()));
+        return !!(state.enabled && state.bottomControlsVisible && netflixBottomControlsVisibleNow() && (selectorDomIsVisible() || selectorIsAppearing() || selectorPanelIsPresent() || selectorHasAttention()));
     }
 
     function netflixControlCandidateSelectors() {
@@ -1759,9 +1761,32 @@
         return player.classList.contains('passive') ? 'passive' : '';
     }
 
+    function updateBottomControlVisibility(visible) {
+        const nextVisible = visible !== false;
+        if (state.bottomControlsVisible === nextVisible) {
+            return;
+        }
+        state.bottomControlsVisible = nextVisible;
+        if (!nextVisible) {
+            state.selectorOpen = false;
+            state.selectorPickerRole = '';
+            releaseNetflixControlHold();
+        }
+        state.selectorSignature = '';
+        renderSelector();
+    }
+
     function handlePlayerControlStateChange(player) {
         const playerState = playerControlState(player);
-        if ((playerState === 'inactive' || playerState === 'passive') && selectorShouldHoldNetflixControls()) {
+        if (playerState === 'active') {
+            updateBottomControlVisibility(true);
+            return;
+        }
+        if (playerState === 'inactive' || playerState === 'passive') {
+            updateBottomControlVisibility(false);
+            return;
+        }
+        if (selectorShouldHoldNetflixControls()) {
             scheduleNetflixControlHoldRefresh();
         }
     }
@@ -1798,6 +1823,9 @@
             new MutationObserver(mutations => {
                 observeNetflixPlayers();
                 scheduleNativeOptionCacheRefresh();
+                if (mutations.some(mutationTouchesNetflixControls)) {
+                    updateBottomControlVisibility(netflixBottomControlsVisibleNow());
+                }
                 if (!selectorShouldHoldNetflixControls()) {
                     return;
                 }
@@ -1938,6 +1966,31 @@
         return document.querySelector('[class*="watch-video--bottom-controls-container"]');
     }
 
+    function netflixBottomControlsVisibleNow() {
+        const bottom = netflixBottomControlsContainer();
+        if (!bottom) {
+            return false;
+        }
+        try {
+            const rect = bottom.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) {
+                return false;
+            }
+            for (let element = bottom; element && element.nodeType === 1; element = element.parentElement) {
+                const style = getComputedStyle(element);
+                if (element.hidden || element.getAttribute('aria-hidden') === 'true' || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || Number(style.opacity) <= 0.05) {
+                    return false;
+                }
+                if (element === document.documentElement) {
+                    break;
+                }
+            }
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
     function selectorShouldMountInNetflixControls() {
         return !!state.enabled;
     }
@@ -1992,11 +2045,13 @@
         mountSelectorNode();
 
         const tracks = Array.from(state.tracks.values()).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+        const selectorDisabled = !state.bottomControlsVisible || !netflixBottomControlsVisibleNow();
         const signature = [
             state.selectorOpen ? 'open' : 'closed',
             state.selectorMount,
             state.selectorPickerRole,
             state.selectorVisible ? 'visible' : 'idle',
+            selectorDisabled ? 'control-hidden' : 'control-visible',
             state.manualDisplay ? 'manual' : 'latest',
             state.displayLangs.join(','),
             JSON.stringify(state.pendingSlotValues),
@@ -2014,9 +2069,10 @@
 
         const selector = state.selectorNode;
         selector.classList.toggle('is-idle', !state.selectorVisible && !state.selectorOpen);
+        selector.classList.toggle('is-control-hidden', selectorDisabled);
         selector.textContent = '';
         appendSelectorIconButton(selector, 'toggle-selector', state.selectorOpen);
-        if (!state.selectorOpen) {
+        if (selectorDisabled || !state.selectorOpen) {
             return;
         }
 
