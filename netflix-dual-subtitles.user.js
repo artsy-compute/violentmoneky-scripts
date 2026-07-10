@@ -2959,8 +2959,13 @@
             return;
         }
 
-        state.root.classList.toggle('is-hidden', !state.enabled);
+        const onPlaybackPage = !!videoId();
+        state.root.classList.toggle('is-hidden', !state.enabled || !onPlaybackPage);
         state.root.classList.toggle('show-status', state.showStatus);
+        if (!onPlaybackPage) {
+            clearSubtitleOverlay();
+            return;
+        }
 
         const summary = state.displayLangs.map(key => {
             const track = state.tracks.get(key);
@@ -4479,11 +4484,48 @@
         scheduleApplyLanguagePreferences();
     }
 
+    function clearVideoContext(reason = '') {
+        if (!state.videoId && !state.displayLangs.length && !state.tracks.size) {
+            clearSubtitleOverlay();
+            return;
+        }
+
+        state.videoId = '';
+        state.requestedUrls.clear();
+        state.tracks.clear();
+        state.displayLangs = [];
+        clearSubtitleOverlay();
+        state.manualDisplay = false;
+        state.preferenceAppliedDisplay = false;
+        state.nativeOptions = [];
+        state.manifestOptions = [];
+        state.nativeAudioOptions = [];
+        state.manifestAudioOptions = [];
+        state.selectedAudioKey = '';
+        state.nativeScanInProgress = false;
+        state.nativeScanAttempted = false;
+        state.prefetchQueue = [];
+        state.prefetchActive = false;
+        state.prefetchedOptionKeys.clear();
+        state.pendingSlots = {};
+        state.pendingSlotValues = {};
+        state.pendingCaptureSlot = '';
+        state.selectorSignature = '';
+        state.transcriptSignature = '';
+        state.lastText = '';
+        state.status = reason || 'left playback page';
+        render();
+    }
+
     function checkWatchIdChange(initial = false) {
         const currentVideoId = videoId();
         if (currentVideoId && currentVideoId !== state.videoId) {
             switchVideoContext(currentVideoId, initial && !state.videoId);
             ensureRuntimeReady();
+            return;
+        }
+        if (!currentVideoId && state.videoId) {
+            clearVideoContext('left playback page');
         }
     }
 
