@@ -31,6 +31,8 @@
     const PREFETCH_DELAY_MS = 140;
     const CUE_START_TOLERANCE_MS = 80;
     const CUE_END_TOLERANCE_MS = 120;
+    const LANGUAGE_PROBE_MAX_ATTEMPTS = 24;
+    const LANGUAGE_PROBE_INTERVAL_MS = 1250;
     const HIDE_NATIVE_PREF_KEY = 'netflix-dual-subtitles:hide-native';
     const LANGUAGE_PREF_KEY = 'netflix-dual-subtitles:language-preferences:v1';
     const TRANSCRIPT_OPACITY_PREF_KEY = 'netflix-dual-subtitles:transcript-opacity';
@@ -125,6 +127,10 @@
         nativeScanInProgress: false,
         nativeScanAttempted: false,
         nativeCacheRefreshScheduled: false,
+        languageProbeTimer: null,
+        languageProbeInProgress: false,
+        languageProbeAttempts: 0,
+        defaultSubtitleAppliedForVideo: '',
         preferenceApplyScheduled: false,
         preferenceApplyInProgress: false,
         preferenceApplySignature: '',
@@ -180,6 +186,18 @@
 
     function langIndexKey() {
         return cachePrefix() + '__langs';
+    }
+
+    function trackBelongsToCurrentVideo(track) {
+        const currentVideoId = currentContextVideoId();
+        if (!track || !currentVideoId) {
+            return false;
+        }
+        return !!track.videoId && String(track.videoId) === String(currentVideoId);
+    }
+
+    function currentVideoTracks() {
+        return Array.from(state.tracks.values()).filter(trackBelongsToCurrentVideo);
     }
 
     function optionCacheKey() {
@@ -493,16 +511,16 @@
         if (!raw) {
             return '';
         }
-        if (state.tracks.has(raw)) {
+        if (trackBelongsToCurrentVideo(state.tracks.get(raw))) {
             return raw;
         }
 
         const normalized = normalizeLang(raw);
-        if (normalized && state.tracks.has(normalized)) {
+        if (normalized && trackBelongsToCurrentVideo(state.tracks.get(normalized))) {
             return normalized;
         }
         if (normalized) {
-            const match = Array.from(state.tracks.values())
+            const match = currentVideoTracks()
                 .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0))
                 .find(track => normalizeLang(track.lang) === normalized);
             return match ? trackCacheKey(match) : '';
@@ -539,6 +557,9 @@
         };
         if (Array.isArray(option.urls) && option.urls.length) {
             cached.urls = option.urls.filter(Boolean).map(String).slice(0, 12);
+        }
+        if (option.selected) {
+            cached.selected = true;
         }
         ['sourceUrl', 'trackId', 'channels'].forEach(field => {
             if (option[field]) {
@@ -685,10 +706,10 @@
         if (!option) {
             return '';
         }
-        if (option.key && state.tracks.has(option.key)) {
+        if (option.key && trackBelongsToCurrentVideo(state.tracks.get(option.key))) {
             return option.key;
         }
-        const match = Array.from(state.tracks.values()).find(track =>
+        const match = currentVideoTracks().find(track =>
             option.key && track.optionKey === option.key ||
             option.urls && option.urls.some(url => url && url === track.sourceUrl)
         );
@@ -697,7 +718,7 @@
         }
         const optionLang = normalizeLang(option.lang || '');
         if (optionLang) {
-            const tracksByScore = Array.from(state.tracks.values())
+            const tracksByScore = currentVideoTracks()
                 .map(track => ({ track, score: languageMatchScore(track.lang || '', optionLang) }))
                 .filter(item => Number.isFinite(item.score))
                 .sort((a, b) => a.score - b.score || (b.track.savedAt || 0) - (a.track.savedAt || 0));
@@ -894,7 +915,7 @@
     }
 
     function latestTrackKeys() {
-        return Array.from(state.tracks.values())
+        return currentVideoTracks()
             .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0))
             .map(trackCacheKey)
             .filter(Boolean);
@@ -932,7 +953,7 @@
 
         const before = state.displayLangs.join('\n');
         state.displayLangs = [key, ...state.displayLangs.filter(item => item !== key)]
-            .filter(item => state.tracks.has(item))
+            .filter(item => trackBelongsToCurrentVideo(state.tracks.get(item)))
             .slice(0, MAX_DISPLAY_LANGS);
         invalidateSubtitleRender();
         state.selectorSignature = '';
@@ -942,19 +963,19 @@
     function setDisplaySlot(slot, value) {
         const index = slot === 'secondary' ? 1 : 0;
         const key = resolveTrackKey(value);
-        const next = state.displayLangs.filter(item => state.tracks.has(item));
+        const next = state.displayLangs.filter(item => trackBelongsToCurrentVideo(state.tracks.get(item)));
 
         state.manualDisplay = true;
         state.preferenceAppliedDisplay = !!state.preferenceApplyInProgress;
         if (!normalizeTrackKey(value)) {
             next.splice(index, 1);
-        } else if (key && state.tracks.has(key)) {
+        } else if (key && trackBelongsToCurrentVideo(state.tracks.get(key))) {
             next[index] = key;
         } else {
             return;
         }
 
-        state.displayLangs = next.filter((item, itemIndex, array) => item && array.indexOf(item) === itemIndex).slice(0, MAX_DISPLAY_LANGS);
+        state.displayLangs = next.filter((item, itemIndex, array) => item && trackBelongsToCurrentVideo(state.tracks.get(item)) && array.indexOf(item) === itemIndex).slice(0, MAX_DISPLAY_LANGS);
         if (!state.preferenceApplyInProgress) {
             const preference = key ? preferenceIdentityForSubtitle(state.tracks.get(key)) : { off: true };
             const preferenceRole = index === 0 ? 'primary' : 'secondary';
@@ -981,7 +1002,7 @@
         state.manualDisplay = true;
         state.preferenceAppliedDisplay = false;
         state.displayLangs = [state.displayLangs[1], state.displayLangs[0]]
-            .filter(item => item && state.tracks.has(item))
+            .filter(item => item && trackBelongsToCurrentVideo(state.tracks.get(item)))
             .slice(0, MAX_DISPLAY_LANGS);
         updateLanguagePreference(target => {
             const previousPrimary = target.primary;
@@ -1068,6 +1089,12 @@
             return false;
         }
 
+        const trackVideoId = String(options.videoId || currentContextVideoId() || '');
+        const activeVideoId = currentContextVideoId();
+        if (trackVideoId && activeVideoId && trackVideoId !== activeVideoId) {
+            return false;
+        }
+
         const key = normalizeTrackKey(options.key || options.optionKey || normalized);
         const label = normalizeNativeLabel(options.label || options.displayName || normalized);
         const track = {
@@ -1078,7 +1105,7 @@
             cues: cues.slice().sort((a, b) => a.start - b.start),
             sourceUrl: sourceUrl || '',
             savedAt: Date.now(),
-            videoId: currentContextVideoId()
+            videoId: trackVideoId
         };
         state.tracks.set(key, track);
 
@@ -1136,7 +1163,7 @@
 
                 const track = JSON.parse(raw);
                 const currentVideoId = currentContextVideoId();
-                if (track && track.videoId && currentVideoId && String(track.videoId) !== String(currentVideoId)) {
+                if (currentVideoId && (!track || !track.videoId || String(track.videoId) !== String(currentVideoId))) {
                     continue;
                 }
                 const trackLang = normalizeLang(track && track.lang || candidateKey);
@@ -1160,8 +1187,7 @@
         } catch (_) {}
     }
 
-    function clearCachedTracks() {
-        const prefix = cachePrefix();
+    function resetSubtitleBuffersForCurrentVideo() {
         state.tracks.clear();
         state.displayLangs = [];
         clearSubtitleOverlay();
@@ -1172,6 +1198,7 @@
         state.nativeAudioOptions = [];
         state.manifestAudioOptions = [];
         state.selectedAudioKey = '';
+        resetLanguageProbe();
         state.nativeScanInProgress = false;
         state.nativeScanAttempted = false;
         state.nativeCacheRefreshScheduled = false;
@@ -1182,6 +1209,11 @@
         state.pendingSlotValues = {};
         state.pendingCaptureSlot = '';
         state.selectorSignature = '';
+        state.lastText = '';
+    }
+
+    function removeCurrentVideoSubtitleCache() {
+        const prefix = cachePrefix();
         try {
             const keys = [];
             for (let index = 0; index < localStorage.length; index += 1) {
@@ -1192,9 +1224,39 @@
             }
             keys.forEach(key => localStorage.removeItem(key));
         } catch (_) {}
-        state.lastText = '';
+    }
+
+    function clearCachedTracks() {
+        removeCurrentVideoSubtitleCache();
+        resetSubtitleBuffersForCurrentVideo();
         state.status = 'cache cleared';
         render();
+    }
+
+    function reloadCurrentSubtitles(reason = 'reloading current subtitles') {
+        if (!currentContextVideoId()) {
+            notify('Open a Netflix video before reloading subtitles');
+            return;
+        }
+        removeCurrentVideoSubtitleCache();
+        resetSubtitleBuffersForCurrentVideo();
+        state.status = reason;
+        notify(state.status);
+        render();
+        scheduleApplyLanguagePreferences();
+        scheduleLanguageDiscoveryProbe(100);
+        refreshNativeOptions(true);
+    }
+
+    function selectedSubtitleTracksBelongToCurrentVideo() {
+        const staleKeys = state.displayLangs.filter(key => key && state.tracks.has(key) && !trackBelongsToCurrentVideo(state.tracks.get(key)));
+        if (!staleKeys.length) {
+            return true;
+        }
+        const currentVideoId = currentContextVideoId();
+        state.status = 'stale subtitles detected for current video: ' + currentVideoId;
+        reloadCurrentSubtitles('stale subtitles detected; reloading current subtitles');
+        return false;
     }
 
     function addStyles() {
@@ -1759,6 +1821,12 @@
                 swapDisplaySubtitleSlots();
                 return;
             }
+            if (action === 'reload-subtitles') {
+                state.selectorPickerRole = '';
+                state.selectorSignature = '';
+                reloadCurrentSubtitles();
+                return;
+            }
             if (action === 'open-picker') {
                 const role = actionNode.dataset ? actionNode.dataset.role : '';
                 state.selectorPickerRole = state.selectorPickerRole === role ? '' : role;
@@ -1993,7 +2061,27 @@
         button.dataset.action = 'swap-subtitles';
         button.className = 'nds-swap-button';
         button.textContent = 'Primary ↔ Secondary';
-        button.disabled = state.displayLangs.filter(key => key && state.tracks.has(key)).length < 2;
+        button.disabled = state.displayLangs.filter(key => key && trackBelongsToCurrentVideo(state.tracks.get(key))).length < 2;
+        row.appendChild(button);
+
+        parent.appendChild(row);
+    }
+
+    function appendSubtitleReloadChoice(parent) {
+        const row = document.createElement('div');
+        row.className = 'nds-swap-row';
+
+        const label = document.createElement('div');
+        label.className = 'nds-selector-row-label';
+        label.textContent = 'Reload';
+        row.appendChild(label);
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.action = 'reload-subtitles';
+        button.className = 'nds-swap-button';
+        button.textContent = 'Reload current subtitles';
+        button.disabled = !currentContextVideoId();
         row.appendChild(button);
 
         parent.appendChild(row);
@@ -2024,7 +2112,7 @@
     function updateTranscriptPointer() {
         const panel = state.transcriptNode;
         const primaryTrack = state.tracks.get(state.displayLangs[0] || '');
-        if (!state.transcriptOpen || !panel || !primaryTrack) {
+        if (!state.transcriptOpen || !panel || !trackBelongsToCurrentVideo(primaryTrack)) {
             return false;
         }
         const currentCueIndex = transcriptCurrentCueIndex(primaryTrack);
@@ -2080,10 +2168,11 @@
 
     function appendSubtitleTranscript(parent) {
         const primaryTrack = state.tracks.get(state.displayLangs[0] || '');
-        if (!primaryTrack || !Array.isArray(primaryTrack.cues) || !primaryTrack.cues.length) {
+        if (!trackBelongsToCurrentVideo(primaryTrack) || !Array.isArray(primaryTrack.cues) || !primaryTrack.cues.length) {
             return;
         }
-        const secondaryTrack = state.tracks.get(state.displayLangs[1] || '');
+        const rawSecondaryTrack = state.tracks.get(state.displayLangs[1] || '');
+        const secondaryTrack = trackBelongsToCurrentVideo(rawSecondaryTrack) ? rawSecondaryTrack : null;
 
         const block = document.createElement('div');
         block.className = 'nds-transcript-block';
@@ -2792,8 +2881,10 @@
         if (!state.transcriptNode || !state.transcriptToggleNode) {
             return;
         }
-        const primaryTrack = state.tracks.get(state.displayLangs[0] || '');
-        const secondaryTrack = state.tracks.get(state.displayLangs[1] || '');
+        const rawPrimaryTrack = state.tracks.get(state.displayLangs[0] || '');
+        const rawSecondaryTrack = state.tracks.get(state.displayLangs[1] || '');
+        const primaryTrack = trackBelongsToCurrentVideo(rawPrimaryTrack) ? rawPrimaryTrack : null;
+        const secondaryTrack = trackBelongsToCurrentVideo(rawSecondaryTrack) ? rawSecondaryTrack : null;
         const signature = [
             state.transcriptOpen ? 'open' : 'closed',
             state.transcriptOpacity,
@@ -2882,7 +2973,7 @@
         rememberSelectorPanelScroll();
         mountSelectorNode();
 
-        const tracks = Array.from(state.tracks.values()).sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+        const tracks = currentVideoTracks().sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
         const selectorDisabled = !state.bottomControlsVisible || !netflixBottomControlsVisibleNow();
         const signature = [
             state.selectorOpen ? 'open' : 'closed',
@@ -2942,6 +3033,7 @@
             pickerOptions.primary = appendLanguageChoice(panel, 'primary', tracks);
             pickerOptions.secondary = appendLanguageChoice(panel, 'secondary', tracks);
             appendSubtitleSwapChoice(panel);
+            appendSubtitleReloadChoice(panel);
         }
         if (state.selectorPickerRole && pickerOptions[state.selectorPickerRole]) {
             const pickerTitle = state.selectorPickerRole === 'audio' ? 'Audio' : state.selectorPickerRole === 'primary' ? 'Primary' : 'Secondary';
@@ -2969,7 +3061,7 @@
 
         const summary = state.displayLangs.map(key => {
             const track = state.tracks.get(key);
-            return track ? trackDisplayLabel(track) + ':' + track.cues.length : key + ':0';
+            return track && trackBelongsToCurrentVideo(track) ? trackDisplayLabel(track) + ':' + track.cues.length : key + ':stale';
         }).join(' ');
         state.statusNode.textContent = state.status + ' | ' + (state.manualDisplay ? 'manual' : 'latest') + ' | ' + summary + ' | video:' + videoId();
         renderSelector();
@@ -2977,6 +3069,10 @@
         updateTranscriptPointer();
 
         if (!state.enabled || !state.displayLangs.length) {
+            clearSubtitleOverlay();
+            return;
+        }
+        if (!selectedSubtitleTracksBelongToCurrentVideo()) {
             clearSubtitleOverlay();
             return;
         }
@@ -2990,11 +3086,12 @@
         const timeMs = video.currentTime * 1000;
         const lines = state.displayLangs.map((key, index) => {
             const track = state.tracks.get(key);
+            const validTrack = trackBelongsToCurrentVideo(track) ? track : null;
             return {
-                lang: track ? track.lang : key,
-                label: trackDisplayLabel(track),
+                lang: validTrack ? validTrack.lang : key,
+                label: trackDisplayLabel(validTrack),
                 role: index === 0 ? 'primary' : 'secondary',
-                cue: cueAt(track, timeMs),
+                cue: cueAt(validTrack, timeMs),
             };
         })
             .filter(item => item.cue && item.cue.text);
@@ -3604,6 +3701,7 @@
         }
         state.selectorSignature = '';
         renderSelector();
+        scheduleLanguageDiscoveryProbe(900);
 
         notify('Fetching Netflix subtitle: ' + option.label);
         for (const url of option.urls) {
@@ -3619,7 +3717,7 @@
 
                 const lang = inferPayloadLang(body) || option.lang;
                 const cues = parseCues(body);
-                if (lang && saveTrack(lang, cues, url, { key: option.key, optionKey: option.key, label: option.label, displaySlot: slot })) {
+                if (lang && saveTrack(lang, cues, url, { key: option.key, optionKey: option.key, label: option.label, displaySlot: slot, videoId: requestVideoId })) {
                     return true;
                 }
             } catch (_) {}
@@ -3695,8 +3793,9 @@
             preserveDisplay: true,
             key: option.key,
             optionKey: option.key,
-            label: option.label
-        } : { silent: true, preserveDisplay: true };
+            label: option.label,
+            videoId: currentVideoId
+        } : { silent: true, preserveDisplay: true, videoId: currentVideoId };
         if (!saveTrack(lang, cues, url, saveOptions)) {
             state.status = 'intercepted ' + rawLang + ' but could not parse len=' + payload.length;
             render();
@@ -4084,6 +4183,20 @@
         return result.length ? result : nodes;
     }
 
+    function nativeOptionSelected(node, kind = 'subtitle') {
+        if (!node) {
+            return false;
+        }
+        const dataUia = node.getAttribute('data-uia') || '';
+        if (new RegExp('^' + kind + '-item-selected-', 'i').test(dataUia)) {
+            return true;
+        }
+        if (/selected/i.test(dataUia)) {
+            return true;
+        }
+        return !!node.querySelector('[data-uia$="selected"], [data-uia*="selected"], [data-icon*="Check"], .svg-icon-nflayerCheck');
+    }
+
     function nativeOptionFromNode(node, kind = 'subtitle') {
         const raw = optionTextFromNode(node, kind).replace(/\s+selected$/i, '').trim();
         const label = normalizeNativeLabel(raw);
@@ -4095,7 +4208,7 @@
         if (!lang) {
             return null;
         }
-        return { key: kind + ':' + nativeLabelKey(label), label, lang, element: node, source: 'native-' + kind };
+        return { key: kind + ':' + nativeLabelKey(label), label, lang, element: node, source: 'native-' + kind, selected: nativeOptionSelected(node, kind) };
     }
 
     function nativeMediaRows(kind) {
@@ -4169,13 +4282,334 @@
 
     function collectNativeAudioOptions() {
         const options = nativeAudioCandidates()
-            .map(option => ({ key: option.key, label: option.label, lang: option.lang, source: 'native-audio' }))
-            .sort((a, b) => a.label.localeCompare(b.label));
+            .map(option => ({ key: option.key, label: option.label, lang: option.lang, source: 'native-audio', selected: !!option.selected }))
+            .sort((a, b) => Number(b.selected) - Number(a.selected) || a.label.localeCompare(b.label));
         state.nativeAudioOptions = options;
         saveOptionCache();
         state.selectorSignature = '';
         renderSelector();
         return mergedAudioOptions();
+    }
+
+
+    function selectedOrOriginalAudioOption() {
+        const audioOptions = mergedAudioOptions();
+        return audioOptions.find(option => option.selected) ||
+            audioOptions.find(option => state.selectedAudioKey && option.key === state.selectedAudioKey) ||
+            audioOptions.find(option => /original|原始|原音|原聲|原声|オリジナル/i.test(option.label || '') && !isAudioDescriptionLabel(option.label)) ||
+            audioOptions.find(option => !isAudioDescriptionLabel(option.label)) ||
+            audioOptions[0] || null;
+    }
+
+    function subtitleOptionForLang(lang, usedKeys = new Set()) {
+        const normalized = normalizeLang(lang);
+        if (!normalized) {
+            return null;
+        }
+        return mergedNativeOptions()
+            .filter(option => option && option.key && !usedKeys.has(option.key))
+            .map(option => ({ option, score: languageMatchScore(option.lang || '', normalized) }))
+            .filter(item => Number.isFinite(item.score))
+            .sort((a, b) => a.score - b.score || subtitleVariantScore(a.option) - subtitleVariantScore(b.option) || a.option.label.localeCompare(b.option.label))[0]?.option || null;
+    }
+
+    function fallbackSubtitleOption(usedKeys = new Set()) {
+        return mergedNativeOptions()
+            .filter(option => option && option.key && !usedKeys.has(option.key))
+            .sort((a, b) => subtitleVariantScore(a) - subtitleVariantScore(b) || a.label.localeCompare(b.label))[0] || null;
+    }
+
+    function selectedCurrentSubtitleCount() {
+        return state.displayLangs.filter(key => key && trackBelongsToCurrentVideo(state.tracks.get(key))).length;
+    }
+
+    function pendingOfficialSubtitleOption(slot) {
+        const pendingValue = state.pendingSlotValues[slot] || '';
+        if (!pendingValue.startsWith('official:')) {
+            return null;
+        }
+        const optionKey = pendingValue.slice('official:'.length);
+        return mergedNativeOptions().find(option => option.key === optionKey) || null;
+    }
+
+    function pendingSubtitleSlotCount() {
+        return ['primary', 'secondary'].filter(slot => !!pendingOfficialSubtitleOption(slot)).length;
+    }
+
+    async function reconcilePendingSubtitleSelections() {
+        const currentVideoId = currentContextVideoId();
+        if (!currentVideoId) {
+            return false;
+        }
+
+        let changed = false;
+        const previousPreferenceApply = state.preferenceApplyInProgress;
+        state.preferenceApplyInProgress = true;
+        try {
+            for (const slot of ['primary', 'secondary']) {
+                const option = pendingOfficialSubtitleOption(slot);
+                if (!option || currentVideoId !== currentContextVideoId()) {
+                    continue;
+                }
+                const cachedKey = cachedTrackKeyForOption(option);
+                if (cachedKey) {
+                    setDisplaySlot(slot, cachedKey);
+                    changed = true;
+                    continue;
+                }
+                const fetched = option.urls && option.urls.length ?
+                    await fetchOfficialSubtitleForSlot(slot, option) :
+                    await selectOfficialSubtitleForSlot(slot, option.key);
+                changed = changed || !!fetched;
+            }
+        } finally {
+            state.preferenceApplyInProgress = previousPreferenceApply;
+        }
+        return changed;
+    }
+
+    function subtitleSelectionHealthy(optionCount) {
+        const wanted = Math.min(2, Math.max(optionCount, selectedCurrentSubtitleCount(), pendingSubtitleSlotCount()));
+        return wanted > 0 && selectedCurrentSubtitleCount() >= wanted;
+    }
+
+    function subtitleTargetKey(target) {
+        if (!target) {
+            return '';
+        }
+        if (target.type === 'track') {
+            return trackCacheKey(target.track);
+        }
+        return target.option && target.option.key || '';
+    }
+
+    function subtitleTargetLang(target) {
+        if (!target) {
+            return '';
+        }
+        return normalizeLang(target.type === 'track' ? target.track && target.track.lang : target.option && target.option.lang);
+    }
+
+    function subtitleTargetLabel(target) {
+        if (!target) {
+            return '';
+        }
+        return target.type === 'track' ? trackDisplayLabel(target.track) : target.option && target.option.label || '';
+    }
+
+    function markSubtitleTargetUsed(target, usedKeys) {
+        if (!target) {
+            return;
+        }
+        const key = subtitleTargetKey(target);
+        if (key) {
+            usedKeys.add(key);
+        }
+        if (target.type === 'track' && target.track && target.track.optionKey) {
+            usedKeys.add(target.track.optionKey);
+        }
+        if (target.type === 'option' && target.option) {
+            const cachedKey = cachedTrackKeyForOption(target.option);
+            if (cachedKey) {
+                usedKeys.add(cachedKey);
+            }
+        }
+    }
+
+    function bestSubtitlePreferenceTarget(preference, usedKeys = new Set()) {
+        const trackMatches = Array.from(state.tracks.values())
+            .filter(track => !usedKeys.has(trackCacheKey(track)) && !usedKeys.has(track.optionKey || ''))
+            .map(track => ({ type: 'track', track, score: subtitlePreferenceScore(preference, track) }));
+        const optionMatches = mergedNativeOptions()
+            .filter(option => {
+                const cachedKey = cachedTrackKeyForOption(option);
+                return option && option.key && !usedKeys.has(option.key) && (!cachedKey || !usedKeys.has(cachedKey));
+            })
+            .map(option => ({ type: 'option', option, score: subtitlePreferenceScore(preference, option) }));
+        return [...trackMatches, ...optionMatches]
+            .filter(item => Number.isFinite(item.score))
+            .sort((a, b) => a.score - b.score || (a.type === 'track' ? 0 : 1) - (b.type === 'track' ? 0 : 1) || subtitleTargetLabel(a).localeCompare(subtitleTargetLabel(b)))[0] || null;
+    }
+
+    function subtitleTargetForLang(lang, usedKeys = new Set()) {
+        const normalized = normalizeLang(lang);
+        return normalized ? bestSubtitlePreferenceTarget({ lang: normalized }, usedKeys) : null;
+    }
+
+    async function applySubtitleTargetForSlot(role, target) {
+        if (!target) {
+            return false;
+        }
+        if (target.type === 'track') {
+            setDisplaySlot(role, trackCacheKey(target.track));
+            return true;
+        }
+        if (!target.option) {
+            return false;
+        }
+        if (target.option.urls && target.option.urls.length) {
+            return fetchOfficialSubtitleForSlot(role, target.option);
+        }
+        return selectOfficialSubtitleForSlot(role, target.option.key);
+    }
+
+    async function applyDefaultSubtitlePair() {
+        const currentVideoId = currentContextVideoId();
+        const selectedCount = selectedCurrentSubtitleCount();
+        if (!currentVideoId || selectedCount >= 2 || state.defaultSubtitleAppliedForVideo === currentVideoId && selectedCount >= 2) {
+            if (selectedCount >= 2) {
+                state.defaultSubtitleAppliedForVideo = currentVideoId;
+            }
+            return selectedCount >= 2;
+        }
+
+        const used = new Set();
+        const usedLangs = [];
+        const addUsedLang = lang => {
+            const normalized = normalizeLang(lang);
+            if (normalized && !usedLangs.some(item => languagesCompatible(item, normalized))) {
+                usedLangs.push(normalized);
+            }
+        };
+        const hasUsedLang = lang => {
+            const normalized = normalizeLang(lang);
+            return !!normalized && usedLangs.some(item => languagesCompatible(item, normalized));
+        };
+
+        state.displayLangs.forEach(key => {
+            const track = state.tracks.get(key);
+            if (track) {
+                used.add(key);
+                if (track.optionKey) {
+                    used.add(track.optionKey);
+                }
+                addUsedLang(track.lang);
+            }
+        });
+
+        const missingRoles = ['primary', 'secondary'].filter((role, index) => !state.displayLangs[index] || !trackBelongsToCurrentVideo(state.tracks.get(state.displayLangs[index])));
+        const targets = [];
+        const pushTarget = target => {
+            if (!target || targets.length >= missingRoles.length) {
+                return false;
+            }
+            markSubtitleTargetUsed(target, used);
+            addUsedLang(subtitleTargetLang(target));
+            targets.push({ role: missingRoles[targets.length], target });
+            return true;
+        };
+        const pushLangTarget = lang => {
+            if (hasUsedLang(lang)) {
+                return false;
+            }
+            return pushTarget(subtitleTargetForLang(lang, used));
+        };
+
+        const preference = storedLanguagePreference();
+        const rememberedSubtitlePreferences = ['primary', 'secondary']
+            .map(role => preference[role])
+            .filter(item => item && !item.off && normalizeLang(item.lang || ''));
+
+        rememberedSubtitlePreferences.forEach(item => pushTarget(bestSubtitlePreferenceTarget(item, used)));
+
+        if (rememberedSubtitlePreferences.length) {
+            ['en', 'ja'].forEach(pushLangTarget);
+        } else {
+            const originalAudio = selectedOrOriginalAudioOption();
+            const originalLang = normalizeLang(originalAudio && originalAudio.lang || '');
+            if (originalLang) {
+                pushLangTarget(originalLang);
+            }
+            pushLangTarget('en');
+        }
+
+        while (targets.length < missingRoles.length) {
+            const fallback = fallbackSubtitleOption(used);
+            if (!fallback) {
+                break;
+            }
+            pushTarget({ type: 'option', option: fallback });
+        }
+
+        if (!targets.length) {
+            return false;
+        }
+
+        const previousPreferenceApply = state.preferenceApplyInProgress;
+        state.preferenceApplyInProgress = true;
+        try {
+            for (const item of targets.slice(0, missingRoles.length)) {
+                if (currentVideoId !== currentContextVideoId()) {
+                    return false;
+                }
+                await applySubtitleTargetForSlot(item.role, item.target);
+            }
+        } finally {
+            state.preferenceApplyInProgress = previousPreferenceApply;
+        }
+
+        const ready = selectedCurrentSubtitleCount() >= Math.min(2, selectedCount + targets.length);
+        if (ready) {
+            state.defaultSubtitleAppliedForVideo = currentVideoId;
+            state.status = 'default subtitles selected: ' + targets.map(item => subtitleTargetLabel(item.target)).join(' + ');
+            render();
+        }
+        return ready;
+    }
+
+    function resetLanguageProbe() {
+        if (state.languageProbeTimer) {
+            clearTimeout(state.languageProbeTimer);
+            state.languageProbeTimer = null;
+        }
+        state.languageProbeInProgress = false;
+        state.languageProbeAttempts = 0;
+        state.defaultSubtitleAppliedForVideo = '';
+    }
+
+    function scheduleLanguageDiscoveryProbe(delay = 600) {
+        if (!videoId() || state.languageProbeTimer || state.languageProbeInProgress) {
+            return;
+        }
+        state.languageProbeTimer = setTimeout(() => {
+            state.languageProbeTimer = null;
+            runLanguageDiscoveryProbe();
+        }, delay);
+    }
+
+    async function runLanguageDiscoveryProbe() {
+        const requestVideoId = currentContextVideoId();
+        if (!requestVideoId || state.languageProbeInProgress) {
+            return;
+        }
+        state.languageProbeInProgress = true;
+        state.languageProbeAttempts += 1;
+        let shouldRetry = false;
+        try {
+            await refreshNativeOptions(true);
+            if (requestVideoId !== currentContextVideoId()) {
+                return;
+            }
+            const subtitleOptions = mergedNativeOptions();
+            if (subtitleOptions.length) {
+                await reconcilePendingSubtitleSelections();
+                await applyDefaultSubtitlePair();
+            }
+            const enough = subtitleSelectionHealthy(subtitleOptions.length);
+            if (!enough && state.languageProbeAttempts < LANGUAGE_PROBE_MAX_ATTEMPTS && videoId()) {
+                shouldRetry = true;
+                state.status = 'waiting for both selected subtitle tracks to load';
+                render();
+            } else if (!subtitleOptions.length) {
+                state.status = 'No Netflix subtitle languages detected yet';
+                render();
+            }
+        } finally {
+            state.languageProbeInProgress = false;
+            if (shouldRetry && requestVideoId === currentContextVideoId()) {
+                scheduleLanguageDiscoveryProbe(LANGUAGE_PROBE_INTERVAL_MS);
+            }
+        }
     }
 
     async function refreshNativeOptions(openMenu = false) {
@@ -4188,7 +4622,7 @@
         if (state.nativeScanInProgress) {
             return options;
         }
-        if (!state.nativeOptions.length || !state.nativeAudioOptions.length) {
+        if (!state.nativeOptions.length || !state.nativeAudioOptions.length || mergedNativeOptions().length < 2) {
             state.nativeScanInProgress = true;
             state.nativeScanAttempted = true;
             state.selectorSignature = '';
@@ -4417,6 +4851,7 @@
         state.pendingCaptureSlot = slot;
         state.selectorSignature = '';
         renderSelector();
+        scheduleLanguageDiscoveryProbe(900);
 
         if (!await ensureNativeSubtitleMenuOpen()) {
             clearPendingSubtitleSlot(slot, option);
@@ -4460,6 +4895,7 @@
         state.nativeAudioOptions = [];
         state.manifestAudioOptions = [];
         state.selectedAudioKey = '';
+        resetLanguageProbe();
         state.nativeScanInProgress = false;
         state.nativeScanAttempted = false;
         state.prefetchQueue = [];
@@ -4482,9 +4918,11 @@
         }
         render();
         scheduleApplyLanguagePreferences();
+        scheduleLanguageDiscoveryProbe(initial ? 900 : 500);
     }
 
     function clearVideoContext(reason = '') {
+        resetLanguageProbe();
         if (!state.videoId && !state.displayLangs.length && !state.tracks.size) {
             clearSubtitleOverlay();
             return;
@@ -4578,6 +5016,9 @@
         }
         render();
         scheduleApplyLanguagePreferences();
+        if (videoId() && !mergedNativeOptions().length) {
+            scheduleLanguageDiscoveryProbe(900);
+        }
     }
 
     function init() {
