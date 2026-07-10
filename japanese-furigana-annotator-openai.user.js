@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Japanese Furigana Annotator (OpenAI)
 // @namespace    https://local.workspace/
-// @version      0.1.3
+// @version      0.1.4
 // @description  Add furigana to Japanese webpages with OpenAI, configurable from an on-page panel.
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -210,7 +210,7 @@
 
   function cacheKey(model, targetLanguage, paragraphTranslationEnabled, text) {
     const translationMode = paragraphTranslationEnabled === false ? "annotation-only" : "with-translation";
-    return `${model}::${normalizeTargetLanguage(targetLanguage)}::${translationMode}::${text}`;
+    return `${model}::${normalizeTargetLanguage(targetLanguage)}::${translationMode}::vocab-v1::${text}`;
   }
 
   function getCachedResult(config, text) {
@@ -223,6 +223,7 @@
     return {
       html: entry.html,
       translation: typeof entry.translation === "string" ? entry.translation : "",
+      vocabulary: Array.isArray(entry.vocabulary) ? entry.vocabulary : [],
     };
   }
 
@@ -232,6 +233,7 @@
       source: text,
       html: result.html,
       translation: result.translation || "",
+      vocabulary: Array.isArray(result.vocabulary) ? result.vocabulary : [],
       targetLanguage: normalizeTargetLanguage(config.targetLanguage),
       paragraphTranslationEnabled: config.paragraphTranslationEnabled !== false,
       exp: Date.now() + Math.max(0, Number(config.cacheMinutes) || 0) * 60 * 1000,
@@ -521,32 +523,71 @@
     return wrapper;
   }
 
-  function renderTranslationAfterNode(wrapper, translation, targetLanguage, sourceText) {
-    const text = typeof translation === "string" ? translation.trim() : "";
-    if (!text || !(wrapper instanceof Element)) return;
+  function normalizeVocabularyNotes(notes) {
+    if (!Array.isArray(notes)) return [];
+    return notes
+      .map((note) => ({
+        term: typeof note?.term === "string" ? note.term.trim() : "",
+        reading: typeof note?.reading === "string" ? note.reading.trim() : "",
+        meaning: typeof note?.meaning === "string" ? note.meaning.trim() : "",
+        note: typeof note?.note === "string" ? note.note.trim() : "",
+      }))
+      .filter((note) => note.term && (note.meaning || note.note))
+      .slice(0, 4);
+  }
+
+  function formatVocabularyNote(note) {
+    const reading = note.reading ? ` (${note.reading})` : "";
+    const meaning = note.meaning ? `: ${note.meaning}` : "";
+    const extra = note.note ? ` - ${note.note}` : "";
+    return `${note.term}${reading}${meaning}${extra}`;
+  }
+
+  function renderLearningNotesAfterNode(wrapper, result, config, sourceText) {
+    const translation =
+      config.paragraphTranslationEnabled === false || typeof result?.translation !== "string"
+        ? ""
+        : result.translation.trim();
+    const vocabulary = normalizeVocabularyNotes(result?.vocabulary);
+    if ((!translation && !vocabulary.length) || !(wrapper instanceof Element)) return;
 
     const block =
       wrapper.closest("p, li, blockquote, figcaption, td, th, h1, h2, h3, h4, h5, h6") || wrapper.parentElement;
     if (!block || !block.parentNode) return;
 
-    const key = getTranslationKey(targetLanguage, sourceText);
+    const key = getTranslationKey(config.targetLanguage, sourceText);
     let container = block.nextElementSibling;
     if (!(container instanceof HTMLElement) || !container.hasAttribute(TRANSLATION_ATTR)) {
       container = document.createElement("div");
       container.className = "vm-furigana-translation";
       container.setAttribute(TRANSLATION_ATTR, "1");
-      container.lang = normalizeTargetLanguage(targetLanguage);
+      container.lang = normalizeTargetLanguage(config.targetLanguage);
       block.parentNode.insertBefore(container, block.nextSibling);
     }
 
     const alreadyRendered = Array.from(container.children).some((child) => child.dataset.translationKey === key);
     if (alreadyRendered) return;
 
-    const line = document.createElement("div");
-    line.className = "vm-furigana-translation-line";
-    line.dataset.translationKey = key;
-    line.textContent = text;
-    container.appendChild(line);
+    if (translation) {
+      const line = document.createElement("div");
+      line.className = "vm-furigana-translation-line";
+      line.dataset.translationKey = key;
+      line.textContent = translation;
+      container.appendChild(line);
+    }
+
+    if (vocabulary.length) {
+      const list = document.createElement("ul");
+      list.className = "vm-furigana-vocab-list";
+      list.dataset.translationKey = key;
+      vocabulary.forEach((note) => {
+        const item = document.createElement("li");
+        item.className = "vm-furigana-vocab-item";
+        item.textContent = formatVocabularyNote(note);
+        list.appendChild(item);
+      });
+      container.appendChild(list);
+    }
   }
 
   function restoreAnnotatedNodes() {
@@ -576,6 +617,7 @@
         : typeof result === "object" && typeof result.translation === "string"
           ? result.translation
           : "";
+    const vocabulary = typeof result === "object" ? normalizeVocabularyNotes(result.vocabulary) : [];
     if (!shouldAcceptAnnotatedResult(item.text, html)) {
       pushDebugHistory({
         type: "unchanged_result",
@@ -586,11 +628,9 @@
       return false;
     }
 
-    setCachedResult(config, item.text, { html, translation });
+    setCachedResult(config, item.text, { html, translation, vocabulary });
     const wrapper = wrapAnnotatedNode(item.node, html);
-    if (config.paragraphTranslationEnabled !== false) {
-      renderTranslationAfterNode(wrapper, translation, config.targetLanguage, item.text);
-    }
+    renderLearningNotesAfterNode(wrapper, { translation, vocabulary }, config, item.text);
     return true;
   }
 
@@ -686,6 +726,9 @@
       paragraphTranslationEnabled
         ? "For translation, translate the source text into the requested target language."
         : "For translation, return an empty string.",
+      "For vocabulary, select only useful words or short phrases from the source text that are uncommon, easy to confuse, idiomatic, domain-specific, or likely to be forgotten by a Japanese learner.",
+      "Avoid very common particles, auxiliaries, basic pronouns, and obvious words unless they are used in a confusing way.",
+      "Return at most 4 vocabulary notes per input, with concise meanings and notes in the target language.",
       "Do not summarize, explain, or remove any source text from html.",
       "Preserve punctuation, whitespace, numbers, Latin text, and kana exactly as provided in html.",
       "Do not wrap kana-only text, particles, punctuation, or Latin text in ruby tags.",
@@ -707,8 +750,22 @@
             properties: {
               html: { type: "string" },
               translation: { type: "string" },
+              vocabulary: {
+                type: "array",
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    term: { type: "string" },
+                    reading: { type: "string" },
+                    meaning: { type: "string" },
+                    note: { type: "string" },
+                  },
+                  required: ["term", "reading", "meaning", "note"],
+                },
+              },
             },
-            required: ["html", "translation"],
+            required: ["html", "translation", "vocabulary"],
           },
         },
       },
@@ -728,7 +785,7 @@
             {
               type: "input_text",
               text: JSON.stringify({
-                instruction: "Return one object per input, in the same order. Each object must include html and translation.",
+                instruction: "Return one object per input, in the same order. Each object must include html, translation, and vocabulary.",
                 targetLanguage,
                 targetLanguageLabel,
                 paragraphTranslationEnabled,
@@ -755,7 +812,7 @@
       paragraphTranslationEnabled,
       prompt,
       batchTexts: batch.map((item) => item.text),
-      schema: "json_schema/html_translation_items",
+      schema: "json_schema/html_translation_vocabulary_items",
     });
 
     let lastError = null;
@@ -787,6 +844,7 @@
         return items.map((item) => ({
           html: typeof item?.html === "string" ? item.html : "",
           translation: typeof item?.translation === "string" ? item.translation : "",
+          vocabulary: normalizeVocabularyNotes(item?.vocabulary),
         }));
       } catch (error) {
         lastError = error;
@@ -1029,8 +1087,8 @@
     const checkbox = document.getElementById("vm-furigana-translate-paragraphs");
     const targetLanguage = document.getElementById("vm-furigana-target-language");
     if (!checkbox || !targetLanguage) return;
-    targetLanguage.disabled = !checkbox.checked;
-    targetLanguage.style.opacity = checkbox.checked ? "1" : "0.55";
+    targetLanguage.disabled = false;
+    targetLanguage.style.opacity = "1";
   }
 
   function togglePanel(forceOpen) {
@@ -1193,6 +1251,13 @@
       }
       .vm-furigana-translation-line + .vm-furigana-translation-line {
         margin-top: 0.35em;
+      }
+      .vm-furigana-vocab-list {
+        margin: 0.45em 0 0;
+        padding-left: 1.25em;
+      }
+      .vm-furigana-vocab-item {
+        margin: 0.2em 0;
       }
     `;
 
