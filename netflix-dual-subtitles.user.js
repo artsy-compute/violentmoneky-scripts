@@ -298,14 +298,14 @@
     }
 
     function isCcSubtitleLabel(label) {
-        return /\bCC\b|closed captions?|字幕.*CC/i.test(normalizeNativeLabel(label));
+        return /\b(?:CC|SDH|HOH)\b|closed captions?|subtitles? for (?:the )?(?:deaf|hard of hearing)|字幕.*(?:CC|聽障|听障)|聽障|听障/i.test(normalizeNativeLabel(label));
     }
 
     function subtitleBaseLabelIdentity(label) {
         return optionLabelIdentity(label)
-            .replace(/\s*[\[(（]\s*(?:cc|closed captions?)\s*[\])）]\s*/gi, ' ')
-            .replace(/\s*(?:[-–—:：]|,|，)\s*(?:cc|closed captions?).*$/i, '')
-            .replace(/\bCC\b/gi, '')
+            .replace(/\s*[\[(（]\s*(?:cc|sdh|hoh|closed captions?|subtitles? for (?:the )?(?:deaf|hard of hearing))\s*[\])）]\s*/gi, ' ')
+            .replace(/\s*(?:[-–—:：]|,|，)\s*(?:cc|sdh|hoh|closed captions?|subtitles? for (?:the )?(?:deaf|hard of hearing)).*$/i, '')
+            .replace(/\b(?:CC|SDH|HOH)\b/gi, '')
             .replace(/\s+/g, ' ')
             .trim();
     }
@@ -314,6 +314,9 @@
         const label = normalizeNativeLabel(option && option.label || '');
         const base = subtitleBaseLabelIdentity(label);
         let score = base.length || label.length || 999;
+        if (isCcSubtitleLabel(label)) {
+            score += 20;
+        }
         if (/forced|signs?|songs?|forced narrative|強制|標誌|歌曲/i.test(label)) {
             score += 100;
         }
@@ -722,19 +725,21 @@
                 .map(track => ({ track, score: languageMatchScore(track.lang || '', optionLang) }))
                 .filter(item => Number.isFinite(item.score))
                 .sort((a, b) => a.score - b.score || (b.track.savedAt || 0) - (a.track.savedAt || 0));
+            const optionWantsCc = isCcSubtitleLabel(option.label);
             const exactLang = tracksByScore.filter(item => item.score === 0);
             const sameLabel = tracksByScore.find(item => optionLabelIdentity(trackDisplayLabel(item.track)) === optionLabelIdentity(option.label));
             if (sameLabel) {
                 return trackCacheKey(sameLabel.track);
             }
-            const sameCc = tracksByScore.filter(item => isCcSubtitleLabel(trackDisplayLabel(item.track)) === isCcSubtitleLabel(option.label));
-            if (exactLang.length === 1) {
-                return trackCacheKey(exactLang[0].track);
+            const sameCc = tracksByScore.filter(item => isCcSubtitleLabel(trackDisplayLabel(item.track)) === optionWantsCc);
+            const exactSameCc = exactLang.filter(item => isCcSubtitleLabel(trackDisplayLabel(item.track)) === optionWantsCc);
+            if (exactSameCc.length === 1) {
+                return trackCacheKey(exactSameCc[0].track);
             }
             if (sameCc.length === 1) {
                 return trackCacheKey(sameCc[0].track);
             }
-            if (tracksByScore.length === 1) {
+            if (tracksByScore.length === 1 && isCcSubtitleLabel(trackDisplayLabel(tracksByScore[0].track)) === optionWantsCc) {
                 return trackCacheKey(tracksByScore[0].track);
             }
         }
@@ -791,8 +796,12 @@
         if (preference.base && identity.base && preference.base !== identity.base) {
             score += 12;
         }
-        if (preference.cc !== identity.cc) {
-            score += 30;
+        if (typeof preference.cc === 'boolean') {
+            if (preference.cc !== identity.cc) {
+                score += 80;
+            }
+        } else if (identity.cc) {
+            score += 15;
         }
         return score + subtitleVariantScore(item) / 10;
     }
@@ -4417,7 +4426,7 @@
     }
 
     function bestSubtitlePreferenceTarget(preference, usedKeys = new Set()) {
-        const trackMatches = Array.from(state.tracks.values())
+        const trackMatches = currentVideoTracks()
             .filter(track => !usedKeys.has(trackCacheKey(track)) && !usedKeys.has(track.optionKey || ''))
             .map(track => ({ type: 'track', track, score: subtitlePreferenceScore(preference, track) }));
         const optionMatches = mergedNativeOptions()
@@ -4509,18 +4518,38 @@
         const rememberedSubtitlePreferences = ['primary', 'secondary']
             .map(role => preference[role])
             .filter(item => item && !item.off && normalizeLang(item.lang || ''));
+        const ensureEnglishTarget = () => {
+            if (hasUsedLang('en')) {
+                return false;
+            }
+            const englishTarget = subtitleTargetForLang('en', used);
+            if (!englishTarget) {
+                return false;
+            }
+            if (targets.length < missingRoles.length) {
+                return pushTarget(englishTarget);
+            }
+            const replaceIndex = targets.length > 1 ? 1 : 0;
+            const role = targets[replaceIndex] && targets[replaceIndex].role || missingRoles[replaceIndex] || missingRoles[0];
+            targets[replaceIndex] = { role, target: englishTarget };
+            markSubtitleTargetUsed(englishTarget, used);
+            addUsedLang(subtitleTargetLang(englishTarget));
+            return true;
+        };
 
         rememberedSubtitlePreferences.forEach(item => pushTarget(bestSubtitlePreferenceTarget(item, used)));
 
         if (rememberedSubtitlePreferences.length) {
-            ['en', 'ja'].forEach(pushLangTarget);
+            ensureEnglishTarget();
+            pushLangTarget('ja');
         } else {
             const originalAudio = selectedOrOriginalAudioOption();
             const originalLang = normalizeLang(originalAudio && originalAudio.lang || '');
             if (originalLang) {
                 pushLangTarget(originalLang);
             }
-            pushLangTarget('en');
+            ensureEnglishTarget();
+            pushLangTarget('ja');
         }
 
         while (targets.length < missingRoles.length) {
